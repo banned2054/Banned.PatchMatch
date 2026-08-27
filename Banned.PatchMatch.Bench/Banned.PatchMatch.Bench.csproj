@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<Optimize>true</Optimize>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\Banned.PatchMatch\Banned.PatchMatch.csproj" />
+	</ItemGroup>
+
+	<!-- 开发期编解码依赖，仅用于 realcorpus 模式读取 PNG/JPG 与写出预览，不进入任何 NuGet 包。 -->
+	<ItemGroup>
+		<PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+	</ItemGroup>
+
+</Project>

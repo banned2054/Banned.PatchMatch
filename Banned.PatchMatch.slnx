@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="Banned.PatchMatch/Banned.PatchMatch.csproj" />
+  <Project Path="Banned.PatchMatch.AotSmoke/Banned.PatchMatch.AotSmoke.csproj" />
+  <Project Path="Banned.PatchMatch.Test/Banned.PatchMatch.Test.csproj" />
+  <Project Path="Banned.PatchMatch.Bench/Banned.PatchMatch.Bench.csproj" />
+</Solution>

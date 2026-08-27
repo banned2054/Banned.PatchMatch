@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFrameworks>net10.0;net9.0;net8.0</TargetFrameworks>
+		<PackageId>Banned.PatchMatch</PackageId>
+		<Version>0.2.0</Version>
+		<Authors>banned</Authors>
+		<Copyright>Copyright (c) 2026 banned</Copyright>
+		<RepositoryUrl>https://github.com/banned2054/Banned.PatchMatch</RepositoryUrl>
+		<PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+		<Description>A pure managed .NET implementation of PatchMatch-based image inpainting</Description>
+		<PackageTags>patchmatch;inpainting;image-processing;dotnet;nativeaot</PackageTags>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<IsAotCompatible>true</IsAotCompatible>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<InternalsVisibleTo Include="Banned.PatchMatch.Bench" />
+		<None Include="..\README.md" Pack="true" PackagePath="" />
+		<None Include="..\NOTICE" Pack="true" PackagePath="" />
+	</ItemGroup>
+
+</Project>
