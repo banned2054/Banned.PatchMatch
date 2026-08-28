@@ -156,8 +156,9 @@ public class PatchMatchInpainterTests
         var image = CreateSolidImage(3, 3, 1, 2, 3);
         var mask  = new byte[9];
 
-        Assert.That(() => PatchMatchInpainter.Inpaint(image, mask, 3, 3, FastOptions, cancellation.Token),
-                    Throws.InstanceOf<OperationCanceledException>());
+        Assert.Catch<OperationCanceledException>((Action)(() =>
+                                                     PatchMatchInpainter.Inpaint(image, mask, 3, 3, FastOptions,
+                                                              cancellation.Token)));
     }
 
     [TestCase(0)]
@@ -169,24 +170,26 @@ public class PatchMatchInpainterTests
         var mask    = new byte[9];
         var options = new PatchMatchOptions { PatchRadius = patchRadius };
 
-        Assert.That(
-                    () => PatchMatchInpainter.Inpaint(image, mask, 3, 3, options),
-                    Throws.TypeOf<ArgumentOutOfRangeException>());
+        Assert.Throws<ArgumentOutOfRangeException>((Action)(() =>
+                                                       PatchMatchInpainter.Inpaint(image, mask, 3, 3, options)));
     }
 
     [Test]
     public void Inpaint_InvalidBufferLengths_ThrowMeaningfulErrors()
     {
-        Assert.Multiple(() =>
+        Assert.Multiple((Action)(() =>
         {
-            Assert.That(() => PatchMatchInpainter.Inpaint(new byte[8], new byte[9], 3, 3, FastOptions),
-                        Throws.TypeOf<ArgumentException>());
-            Assert.That(() => PatchMatchInpainter.Inpaint(new byte[27], new byte[8], 3, 3, FastOptions),
-                        Throws.TypeOf<ArgumentException>());
-            Assert.That(() => PatchMatchInpainter.InpaintRegularity(new byte[27], new byte[9], new float[9], 3, 3,
-                                                                    options : FastOptions),
-                        Throws.TypeOf<ArgumentException>());
-        });
+            // 显式指定 Action，规避 NUnit 4.6 在 net8.0（C# 12）下的委托重载二义性。
+            Assert.Throws<ArgumentException>((Action)(() =>
+                                                 PatchMatchInpainter.Inpaint(new byte[8], new byte[9], 3, 3,
+                                                                             FastOptions)));
+            Assert.Throws<ArgumentException>((Action)(() =>
+                                                 PatchMatchInpainter.Inpaint(new byte[27], new byte[8], 3, 3,
+                                                                             FastOptions)));
+            Assert.Throws<ArgumentException>((Action)(() =>
+                                                 PatchMatchInpainter.InpaintRegularity(new byte[27], new byte[9],
+                                                          new float[9], 3, 3, options : FastOptions)));
+        }));
     }
 
     private static byte[] CreateSolidImage(int width, int height, byte channel0, byte channel1, byte channel2)

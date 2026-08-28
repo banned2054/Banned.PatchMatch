@@ -319,6 +319,9 @@ internal sealed class InpaintingEngine
                 }
             }
         }
+
+        // 像素已被原地改写，特征缓冲随之失效，下一轮距离计算前会按当前像素重建。
+        target.InvalidateFeatures();
     }
 
     private static byte SaturateToByte(double value)

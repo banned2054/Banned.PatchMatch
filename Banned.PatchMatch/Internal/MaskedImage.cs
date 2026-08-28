@@ -4,9 +4,13 @@ internal sealed class MaskedImage
 {
     private static readonly int[] DownsampleKernel = [1, 5, 10, 10, 5, 1];
 
-    private byte[]? _gradientY;
-    private byte[]? _gradientX;
-    private bool    _gradientsComputed;
+    internal const int FeatureStride = 12;
+
+    private byte[]?  _gradientY;
+    private byte[]?  _gradientX;
+    private byte[]?  _features;
+    private ulong[]? _invalidBits;
+    private bool     _gradientsComputed;
 
     private MaskedImage(int width, int height, byte[] pixels, byte[] mask, byte[]? globalMask, byte[]? gradientY = null,
                         byte[]? gradientX = null, bool gradientsComputed = false)
@@ -31,6 +35,33 @@ internal sealed class MaskedImage
 
     internal byte[]? GlobalMask { get; private set; }
 
+    /// <summary>
+    /// 合并并压缩后的无效位图（1 = 不可用）。每个 ulong 表示 64 个像素，
+    /// 距离内核可直接提取一段有效位，无需每行重复加载字节 mask 并执行向量比较。
+    /// </summary>
+    internal ulong[] InvalidBits
+    {
+        get
+        {
+            if (_invalidBits is not null)
+            {
+                return _invalidBits;
+            }
+
+            var invalidBits = new ulong[(Mask.Length + 63) / 64];
+            for (var i = 0; i < Mask.Length; i++)
+            {
+                if (Mask[i] != 0 || (GlobalMask is not null && GlobalMask[i] != 0))
+                {
+                    invalidBits[i >> 6] |= 1ul << (i & 63);
+                }
+            }
+
+            _invalidBits = invalidBits;
+            return invalidBits;
+        }
+    }
+
     internal byte[] GradientY
     {
         get
@@ -47,6 +78,67 @@ internal sealed class MaskedImage
             EnsureGradients();
             return _gradientX!;
         }
+    }
+
+    /// <summary>
+    /// 每像素 12 字节的交织特征缓冲（3 像素 + 3 横向梯度 + 3 纵向梯度 + 3 字节零填充），
+    /// 供 SIMD 距离内核将一个有效行程当作单一连续区间处理。相比 16 字节布局工作集减少 25%，
+    /// 降低小图的缓存地址敏感性；两侧填充字节相同，对 SSD 的贡献恒为 0。
+    /// 按需构建；像素被原地修改后必须失效。<br/>
+    /// Interleaved 12-byte-per-pixel feature buffer (3 pixel + 3 X-gradient + 3 Y-gradient
+    /// bytes + 3 zero-padding bytes) letting the SIMD distance kernel treat a valid run as one
+    /// contiguous span. Its working set is 25% smaller than the 16-byte layout, reducing cache
+    /// address sensitivity on small images; identical padding contributes exactly 0 to the SSD.
+    /// Built on demand; must be invalidated after in-place mutation.
+    /// </summary>
+    internal byte[] Features
+    {
+        get
+        {
+            EnsureFeatures();
+            return _features!;
+        }
+    }
+
+    /// <summary>
+    /// 失效特征缓冲。像素发生原地修改后调用，保证特征与像素一致。<br/>
+    /// Invalidates the feature buffer. Call after in-place pixel mutation.
+    /// </summary>
+    internal void InvalidateFeatures()
+    {
+        _features = null;
+    }
+
+    private void EnsureFeatures()
+    {
+        if (_features is not null)
+        {
+            return;
+        }
+
+        var gradientX = GradientX;
+        var gradientY = GradientY;
+        var timestamp = StageProfiler.Begin();
+
+        var features   = new byte[checked(Width * Height * FeatureStride)];
+        var pixelCount = Width * Height;
+        for (var pixel = 0; pixel < pixelCount; pixel++)
+        {
+            var offset = pixel * 3;
+            var target = pixel * FeatureStride;
+            features[target]     = Pixels[offset];
+            features[target + 1] = Pixels[offset + 1];
+            features[target + 2] = Pixels[offset + 2];
+            features[target + 3] = gradientX[offset];
+            features[target + 4] = gradientX[offset + 1];
+            features[target + 5] = gradientX[offset + 2];
+            features[target + 6] = gradientY[offset];
+            features[target + 7] = gradientY[offset + 1];
+            features[target + 8] = gradientY[offset + 2];
+        }
+
+        StageProfiler.End("features", timestamp);
+        _features = features;
     }
 
     internal static MaskedImage Create(ReadOnlySpan<byte> pixels,     ReadOnlySpan<byte> mask,
@@ -82,12 +174,14 @@ internal sealed class MaskedImage
 
     internal void SetMask(int y, int x, bool value)
     {
-        Mask[(y * Width) + x] = value ? (byte)1 : (byte)0;
+        Mask[y * Width + x] = value ? (byte)1 : (byte)0;
+        _invalidBits        = null;
     }
 
     internal void ClearMask()
     {
         Array.Clear(Mask);
+        _invalidBits = null;
     }
 
     internal bool ContainsMask(int y, int x, int patchRadius)
