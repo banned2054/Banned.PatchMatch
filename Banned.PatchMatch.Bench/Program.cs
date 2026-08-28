@@ -3,6 +3,7 @@ using Banned.PatchMatch.Internal;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using System.Diagnostics;
+using System.Runtime.Intrinsics;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -23,8 +24,11 @@ switch (args.FirstOrDefault())
     case "realcorpus" :
         RunRealCorpus(args.Length > 1 ? args[1] : Path.Combine("artifacts", "tests"));
         break;
+    case "simd" :
+        RunSimdVerification(args.Length > 1 ? int.Parse(args[1]) : 2048);
+        break;
     default :
-        Console.WriteLine("usage: Banned.PatchMatch.Bench <stages|corpus [dir]|bench|realcorpus [dir]>");
+        Console.WriteLine("usage: Banned.PatchMatch.Bench <stages|corpus [dir]|bench|realcorpus [dir]|simd [maxSize]>");
         Console.WriteLine("       build with -c Release for meaningful numbers");
         return 1;
 }
@@ -212,7 +216,7 @@ static void BenchmarkDistanceKernel()
         // 预热：让 JIT 分层编译与梯度缓存稳定。
         for (var warmup = 0; warmup < 10; warmup++)
         {
-            RunDistanceSample(target, pairs, patchRadius);
+            RunDistanceSampleSelf(target, pairs, patchRadius);
         }
 
         const int samples   = 31;
@@ -221,7 +225,7 @@ static void BenchmarkDistanceKernel()
         for (var sample = 0; sample < samples; sample++)
         {
             var sw = Stopwatch.StartNew();
-            checksums[sample] = RunDistanceSample(target, pairs, patchRadius);
+            checksums[sample] = RunDistanceSampleSelf(target, pairs, patchRadius);
             sw.Stop();
             timings[sample] = sw.Elapsed.TotalMilliseconds;
         }
@@ -241,7 +245,8 @@ static void BenchmarkDistanceKernel()
     }
 }
 
-static long RunDistanceSample(MaskedImage target, (int Y, int X)[] pairs, int patchRadius)
+// 阶段 0 冻结的自距离微基准采样（source == target），保留以便与阶段 0 数据直接对比。
+static long RunDistanceSampleSelf(MaskedImage target, (int Y, int X)[] pairs, int patchRadius)
 {
     long checksum = 0;
     foreach (var (y, x) in pairs)
@@ -299,6 +304,325 @@ static void GenerateCorpus(string directory)
 
     File.WriteAllLines(Path.Combine(directory, "manifest.txt"), entries);
     Console.WriteLine($"wrote {entries.Count} corpus entries (image/mask/truth per entry)");
+}
+
+static void RunSimdVerification(int maxSize)
+{
+    // 阶段 1 验收：同会话交替运行标量与 SIMD 路径。差分冒烟先证一致，再测内核微基准
+    // （≥2× 门槛）与端到端（20%~30% 门槛，对照 Docs/Baseline.md 的阶段 0 数据）。
+    // PM_FORCE_VBYTES=64|32|16 强制向量宽度，用于定位特定 ISA 的性能异常。
+    // Phase-1 acceptance: alternating scalar/SIMD runs in one session. A differential smoke
+    // pass proves equality first, then the kernel micro-benchmark (>=2x gate) and the
+    // end-to-end numbers (20-30% gate vs the stage-0 data in Docs/Baseline.md).
+    // PM_FORCE_VBYTES=64|32|16 forces the vector width to isolate ISA-specific anomalies.
+    if (int.TryParse(Environment.GetEnvironmentVariable("PM_FORCE_VBYTES"), out var forcedBytes))
+    {
+        PatchSsdDistanceMetric.ForceVectorBytes = forcedBytes;
+        Console.WriteLine($"vector width forced to {forcedBytes} bytes");
+    }
+
+    if (Environment.GetEnvironmentVariable("PM_DIAG") is { } diagSize && int.TryParse(diagSize, out var diag))
+    {
+        SimdAllocationDiagnostic(diag);
+        return;
+    }
+
+    Console.WriteLine($"vector capabilities: 512={Vector512.IsHardwareAccelerated} " +
+                      $"256={Vector256.IsHardwareAccelerated} 128={Vector128.IsHardwareAccelerated}");
+
+    SimdDifferentialSmoke();
+    SimdKernelBenchmark(maxSize);
+    SimdEndToEndBenchmark(maxSize);
+}
+
+static void SimdDifferentialSmoke()
+{
+    var random = new Random(99);
+    foreach (var (width, height) in new[] { (33, 17), (65, 49), (96, 72) })
+    {
+        var source = MaskedImage.Create(RandomBytesBench(random, width * height * 3),
+                                        RandomMaskBench(random, width  * height, 0.3f),
+                                        RandomMaskBench(random, width  * height, 0.1f), width, height);
+        var target = MaskedImage.Create(RandomBytesBench(random, width * height * 3),
+                                        RandomMaskBench(random, width  * height, 0.3f),
+                                        RandomMaskBench(random, width  * height, 0.1f), width, height);
+        for (var sample = 0; sample < 200; sample++)
+        {
+            var sourceY = random.Next(-2, height + 2);
+            var sourceX = random.Next(-2, width  + 2);
+            var targetY = random.Next(-2, height + 2);
+            var targetX = random.Next(-2, width  + 2);
+            var expected = PatchSsdDistanceMetric.CalculateImageDistanceScalar(source, sourceY, sourceX,
+                                                                               target, targetY, targetX, 3);
+            foreach (var vectorBytes in new int?[] { 16, 32, 64 })
+            foreach (var featureLayout in new[] { false, true })
+            {
+                PatchSsdDistanceMetric.ForceVectorBytes = vectorBytes;
+                PatchSsdDistanceMetric.UseFeatureLayout = featureLayout;
+                var actual = PatchSsdDistanceMetric.CalculateImageDistance(source, sourceY, sourceX,
+                                                                           target, targetY, targetX, 3);
+                if (actual != expected)
+                {
+                    throw new InvalidOperationException(
+                                                        $"differential failure: {width}x{height} ({sourceY},{sourceX})->({targetY},{targetX}) " +
+                                                        $"vectorBytes={vectorBytes} features={featureLayout}: {actual} != {expected}");
+                }
+            }
+        }
+    }
+
+    PatchSsdDistanceMetric.ForceVectorBytes = ForcedVectorBytes();
+    PatchSsdDistanceMetric.UseFeatureLayout = true;
+    Console.WriteLine("differential smoke: OK (all vector paths == scalar reference)");
+}
+
+static void SimdAllocationDiagnostic(int size)
+{
+    // 判别双态性能根因：同一进程内连续分配多对实例分别计时。
+    // 进程内即现快慢两档 → 分配地址效应；整进程同态 → 代码布局或机器状态。
+    const int instances = 8;
+    var       sources   = new MaskedImage[instances];
+    var       targets   = new MaskedImage[instances];
+    var       random    = new Random(1212);
+    const int calls     = 2048;
+    var       pairs     = new (int Y, int X)[calls];
+    for (var i = 0; i < pairs.Length; i++)
+    {
+        pairs[i] = (random.Next(1, size - 1), random.Next(1, size - 1));
+    }
+
+    for (var i = 0; i < instances; i++)
+    {
+        sources[i] = MaskedImage.Create(SyntheticImages.Textured(size, size, seed : 7 + i),
+                                        new byte[size * size], new byte[size * size], size, size);
+        targets[i] = MaskedImage.Create(SyntheticImages.Textured(size, size, seed : 13 + i),
+                                        new byte[size * size], new byte[size * size], size, size);
+    }
+
+    PatchSsdDistanceMetric.ForceScalar      = false;
+    PatchSsdDistanceMetric.UseFeatureLayout = true;
+    PatchSsdDistanceMetric.ForceVectorBytes = ForcedVectorBytes();
+    for (var i = 0; i < instances; i++)
+    {
+        for (var warmup = 0; warmup < 3; warmup++)
+        {
+            RunDistanceSample(sources[i], targets[i], pairs, 3);
+        }
+
+        var timings = new double[7];
+        for (var sample = 0; sample < timings.Length; sample++)
+        {
+            var sw = Stopwatch.StartNew();
+            RunDistanceSample(sources[i], targets[i], pairs, 3);
+            sw.Stop();
+            timings[sample] = sw.Elapsed.TotalMilliseconds;
+        }
+
+        Array.Sort(timings);
+        Console.WriteLine($"  instance {i}: median {timings[3],7:F2} ms ({1000 * timings[3] / calls,6:F3} us/call)");
+    }
+}
+
+static void SimdKernelBenchmark(int maxSize)
+{
+    // 同一对 source/target 上交替测量标量与 SIMD，先得到每个分配实例的配对加速比，
+    // 再报告中位数与范围。不丢弃“地址运气”不佳的实例，避免最快样本偏差。
+    Console.WriteLine();
+    Console.WriteLine($"kernel micro-benchmark (9 paired allocations; median of 15 samples each):");
+    // PM_SWEEP=1 时扫描更多尺寸，用于定位缓存尺寸相关的性能悬崖。
+    var sizes = Environment.GetEnvironmentVariable("PM_SWEEP") is null
+        ? new[] { 256, 512 }
+        : new[] { 192, 224, 256, 288, 320, 384, 448, 512, 640, 768 };
+    foreach (var patchRadius in new[] { 3, 5, 8 })
+    foreach (var size in sizes.Where(size => size <= maxSize))
+    {
+        // 双图：source/target 为不同实例，与真实管线的距离调用形态一致。
+        const int instanceCount = 9;
+        var       sources       = new MaskedImage[instanceCount];
+        var       targets       = new MaskedImage[instanceCount];
+        for (var instance = 0; instance < instanceCount; instance++)
+        {
+            sources[instance] = MaskedImage.Create(SyntheticImages.Textured(size, size, seed : 7 + instance),
+                                                   new byte[size * size], new byte[size * size], size, size);
+            targets[instance] = MaskedImage.Create(SyntheticImages.Textured(size, size, seed : 13 + instance),
+                                                   new byte[size * size], new byte[size * size], size, size);
+        }
+
+        var       random         = new Random(1212);
+        const int callsPerSample = 4096;
+        var       pairs          = new (int Y, int X)[callsPerSample];
+        for (var i = 0; i < pairs.Length; i++)
+        {
+            pairs[i] = (random.Next(1, size - 1), random.Next(1, size - 1));
+        }
+
+        var configurations = new List<(string Name, Action Setup)>
+        {
+            ("scalar (stage-0)", () => { PatchSsdDistanceMetric.ForceScalar = true; }),
+            ("direct layout", () =>
+            {
+                PatchSsdDistanceMetric.ForceScalar      = false;
+                PatchSsdDistanceMetric.UseFeatureLayout = false;
+                PatchSsdDistanceMetric.ForceVectorBytes = ForcedVectorBytes();
+            }),
+            ("feature layout", () =>
+            {
+                PatchSsdDistanceMetric.ForceScalar      = false;
+                PatchSsdDistanceMetric.UseFeatureLayout = true;
+                PatchSsdDistanceMetric.ForceVectorBytes = ForcedVectorBytes();
+            }),
+        };
+
+        var results = configurations.ToDictionary(configuration => configuration.Name,
+                                                  _ => new double[instanceCount]);
+        for (var instance = 0; instance < instanceCount; instance++)
+        {
+            // 奇数实例反转顺序，抵消测量顺序的系统性偏差。
+            var orderedConfigurations = instance % 2 == 0 ? configurations : configurations.AsEnumerable().Reverse();
+            foreach (var (configName, setup) in orderedConfigurations)
+            {
+                setup();
+                results[configName][instance] =
+                    SampleKernelMedian(sources[instance], targets[instance], pairs, patchRadius);
+            }
+        }
+
+        PatchSsdDistanceMetric.ForceScalar = false;
+        var baseline = results["scalar (stage-0)"];
+        foreach (var (name, _) in configurations)
+        {
+            var timings  = results[name];
+            var median   = Median(timings);
+            var speedups = timings.Select((timing, instance) => baseline[instance] / timing).ToArray();
+            Console.WriteLine($"  r={patchRadius} {size}x{size} {name,-20} median {median,7:F2} ms " +
+                              $"({1000 * median / callsPerSample,7:F3} us/call)  "                   +
+                              $"paired speedup {Median(speedups),5:F2}x [{speedups.Min(),5:F2}, {speedups.Max(),5:F2}]");
+        }
+    }
+}
+
+static int? ForcedVectorBytes()
+{
+    return int.TryParse(Environment.GetEnvironmentVariable("PM_FORCE_VBYTES"), out var forced) ? forced : null;
+}
+
+static double SampleKernelMedian(MaskedImage source, MaskedImage target, (int Y, int X)[] pairs, int patchRadius)
+{
+    for (var warmup = 0; warmup < 5; warmup++)
+    {
+        RunDistanceSample(source, target, pairs, patchRadius);
+    }
+
+    const int samples = 15;
+    var       timings = new double[samples];
+    for (var sample = 0; sample < samples; sample++)
+    {
+        var sw = Stopwatch.StartNew();
+        RunDistanceSample(source, target, pairs, patchRadius);
+        sw.Stop();
+        timings[sample] = sw.Elapsed.TotalMilliseconds;
+    }
+
+    Array.Sort(timings);
+    return timings[samples / 2];
+}
+
+static long RunDistanceSample(MaskedImage source, MaskedImage target, (int Y, int X)[] pairs, int patchRadius)
+{
+    long checksum = 0;
+    foreach (var (y, x) in pairs)
+    {
+        var (otherY, otherX) = pairs[(y + x) % pairs.Length];
+        checksum += PatchSsdDistanceMetric.CalculateImageDistance(source, y, x, target, otherY, otherX, patchRadius);
+    }
+
+    return checksum;
+}
+
+static void SimdEndToEndBenchmark(int maxSize)
+{
+    Console.WriteLine();
+    Console.WriteLine($"end-to-end (center-rect ~25% mask, r=3, paired scalar/layouts, median of 5):");
+    foreach (var size in new[] { 256, 512, 1024 }.Where(size => size <= maxSize))
+    {
+        var image   = SyntheticImages.Textured(size, size, seed : 7);
+        var mask    = Masks.CenterRectangle(size, size, size / 4, size / 4, 3 * size / 4, 3 * size / 4);
+        var options = new PatchMatchOptions { PatchRadius = 3, RandomSeed = 1212 };
+
+        double ScalarRun()
+        {
+            PatchSsdDistanceMetric.ForceScalar = true;
+            var sw = Stopwatch.StartNew();
+            PatchMatchInpainter.Inpaint(image, (byte[])mask.Clone(), size, size, options);
+            sw.Stop();
+            return sw.Elapsed.TotalMilliseconds;
+        }
+
+        double VectorRun(bool featureLayout)
+        {
+            PatchSsdDistanceMetric.ForceScalar      = false;
+            PatchSsdDistanceMetric.UseFeatureLayout = featureLayout;
+            PatchSsdDistanceMetric.ForceVectorBytes = null;
+            var sw = Stopwatch.StartNew();
+            PatchMatchInpainter.Inpaint(image, (byte[])mask.Clone(), size, size, options);
+            sw.Stop();
+            return sw.Elapsed.TotalMilliseconds;
+        }
+
+        ScalarRun();
+        VectorRun(false);
+        VectorRun(true); // 预热三条路径
+
+        var scalarSamples  = new double[5];
+        var directSamples  = new double[5];
+        var featureSamples = new double[5];
+        for (var sample = 0; sample < 5; sample++)
+        {
+            // 奇偶样本反转顺序，抵消热漂移与后台噪声。
+            if (sample % 2 == 0)
+            {
+                scalarSamples[sample]  = ScalarRun();
+                directSamples[sample]  = VectorRun(false);
+                featureSamples[sample] = VectorRun(true);
+            }
+            else
+            {
+                featureSamples[sample] = VectorRun(true);
+                directSamples[sample]  = VectorRun(false);
+                scalarSamples[sample]  = ScalarRun();
+            }
+        }
+
+        var scalarMedian = Median(scalarSamples);
+        Console.WriteLine($"  {size}x{size}: scalar median {scalarMedian,8:F0} ms");
+        foreach (var (name, samples) in new[] { ("direct ", directSamples), ("feature", featureSamples) })
+        {
+            var vectorMedian = Median(samples);
+            Console.WriteLine($"             {name} median {vectorMedian,8:F0} ms | " +
+                              $"speedup {scalarMedian / vectorMedian,5:F2}x | "       +
+                              $"saved {100            * (1 - vectorMedian / scalarMedian),5:F1}%");
+        }
+    }
+
+    PatchSsdDistanceMetric.ForceScalar = false;
+}
+
+static byte[] RandomBytesBench(Random random, int count)
+{
+    var result = new byte[count];
+    random.NextBytes(result);
+    return result;
+}
+
+static byte[] RandomMaskBench(Random random, int count, float density)
+{
+    var result = new byte[count];
+    for (var i = 0; i < count; i++)
+    {
+        result[i] = random.NextSingle() < density ? (byte)1 : (byte)0;
+    }
+
+    return result;
 }
 
 static void RunRealCorpus(string directory)
