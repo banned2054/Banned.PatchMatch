@@ -62,16 +62,13 @@ internal struct Vector128SsdSink : ISsdSink
 
     public long Total()
     {
-        var        sum   = _accumulator0 + _accumulator1 + _accumulator2 + _accumulator3;
-        Span<uint> lanes = stackalloc uint[Vector128<uint>.Count];
-        sum.CopyTo(lanes);
-        var total = _tail.Total();
-        foreach (var lane in lanes)
-        {
-            total += lane;
-        }
-
-        return total;
+        // Widen before combining: individually safe uint lanes can overflow when added.
+        var (low0, high0) = Vector128.Widen(_accumulator0);
+        var (low1, high1) = Vector128.Widen(_accumulator1);
+        var (low2, high2) = Vector128.Widen(_accumulator2);
+        var (low3, high3) = Vector128.Widen(_accumulator3);
+        var sum = low0 + high0 + low1 + high1 + low2 + high2 + low3 + high3;
+        return (long)Vector128.Sum(sum) + _tail.Total();
     }
 
     private void Accumulate(Vector128<byte> va, Vector128<byte> vb)
@@ -111,16 +108,13 @@ internal struct Vector256SsdSink : ISsdSink
 
     public long Total()
     {
-        var        sum   = _accumulator0 + _accumulator1 + _accumulator2 + _accumulator3;
-        Span<uint> lanes = stackalloc uint[Vector256<uint>.Count];
-        sum.CopyTo(lanes);
-        var total = _tail.Total();
-        foreach (var lane in lanes)
-        {
-            total += lane;
-        }
-
-        return total;
+        // Widen before combining: individually safe uint lanes can overflow when added.
+        var (low0, high0) = Vector256.Widen(_accumulator0);
+        var (low1, high1) = Vector256.Widen(_accumulator1);
+        var (low2, high2) = Vector256.Widen(_accumulator2);
+        var (low3, high3) = Vector256.Widen(_accumulator3);
+        var sum = low0 + high0 + low1 + high1 + low2 + high2 + low3 + high3;
+        return (long)Vector256.Sum(sum) + _tail.Total();
     }
 
     private void Accumulate(Vector256<byte> va, Vector256<byte> vb)
@@ -159,16 +153,13 @@ internal struct Vector512SsdSink : ISsdSink
 
     public long Total()
     {
-        var        sum   = _accumulator0 + _accumulator1 + _accumulator2 + _accumulator3;
-        Span<uint> lanes = stackalloc uint[Vector512<uint>.Count];
-        sum.CopyTo(lanes);
-        var total = _tail.Total();
-        foreach (var lane in lanes)
-        {
-            total += lane;
-        }
-
-        return total;
+        // Widen before combining: individually safe uint lanes can overflow when added.
+        var (low0, high0) = Vector512.Widen(_accumulator0);
+        var (low1, high1) = Vector512.Widen(_accumulator1);
+        var (low2, high2) = Vector512.Widen(_accumulator2);
+        var (low3, high3) = Vector512.Widen(_accumulator3);
+        var sum = low0 + high0 + low1 + high1 + low2 + high2 + low3 + high3;
+        return (long)Vector512.Sum(sum) + _tail.Total();
     }
 
     private void Accumulate(Vector512<byte> va, Vector512<byte> vb)

@@ -22,8 +22,9 @@ internal sealed class PatchSsdDistanceMetric(int patchRadius) : IPatchDistanceMe
     internal static bool UseFeatureLayout = true;
     internal static int? ForceVectorBytes;
 
-    // uint 累加通道的无回绕上界：最窄的 Vector128 每通道累计 ceil(9(2r+1)²/16) 个平方项，
-    // 每项 ≤ 255²，要求乘积小于 2³²；r ≤ 127 时上界约为 2.4×10⁹，留有充分余量。
+    // uint 累加通道的无回绕上界：按特征布局每像素 12 字节（含零填充）保守计算，
+    // 最窄的 Vector128 每通道至多累计 floor(12(2r+1)²/16) 个平方项，每项 ≤ 255²。
+    // r ≤ 127 时上界约为 3.2×10⁹，小于 2³²；归约前必须扩展为 ulong 再合并通道。
     private const int MaxVectorPatchRadius = 127;
 
     private static readonly int AutoVectorBytes =

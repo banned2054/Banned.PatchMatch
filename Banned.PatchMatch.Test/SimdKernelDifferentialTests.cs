@@ -188,6 +188,84 @@ public class SimdKernelDifferentialTests
         }
     }
 
+    [TestCase(16)]
+    [TestCase(32)]
+    [TestCase(64)]
+    public void SsdSinkReductionDoesNotOverflow(int vectorBytes)
+    {
+        // Each uint accumulator lane stays below its limit, but merging four lanes
+        // in uint overflows. The extra bytes also exercise all narrower tails.
+        const int repetitions = 20_000;
+        var a = new byte[2 * vectorBytes - 1];
+        var b = new byte[a.Length];
+        Array.Fill(b, byte.MaxValue);
+        ISsdSink sink = vectorBytes switch
+        {
+            16 => new Vector128SsdSink(),
+            32 => new Vector256SsdSink(),
+            _ => new Vector512SsdSink(),
+        };
+
+        for (var i = 0; i < repetitions; i++)
+        {
+            sink.Add(a, b);
+        }
+
+        var expected = (long)repetitions * a.Length * 255 * 255;
+        Assert.That(sink.Total(), Is.EqualTo(expected));
+    }
+
+    [TestCase(96)]
+    [TestCase(127)]
+    [TestCase(128)]
+    public void LargePatchDistancesMatchScalarReference(int radius)
+    {
+        var size = 2 * radius + 5;
+        var a = new byte[size * size * 3];
+        var b = new byte[a.Length];
+        for (var y = 0; y < size; y++)
+        for (var x = 0; x < size; x++)
+        {
+            // Complementary 2x2 blocks maximize both pixel and gradient differences.
+            var value = (byte)(255 * (((x >> 1) ^ (y >> 1)) & 1));
+            for (var channel = 0; channel < 3; channel++)
+            {
+                var offset = (y * size + x) * 3 + channel;
+                a[offset] = value;
+                b[offset] = (byte)(255 - value);
+            }
+        }
+
+        var mask = new byte[size * size];
+        var source = MaskedImage.Create(a, mask, Array.Empty<byte>(), size, size);
+        var target = MaskedImage.Create(b, mask, Array.Empty<byte>(), size, size);
+        var center = size / 2;
+        var expected = PatchSsdDistanceMetric.CalculateImageDistanceScalar(
+            source, center, center, target, center, center, radius);
+        var previousWidth = PatchSsdDistanceMetric.ForceVectorBytes;
+        var previousLayout = PatchSsdDistanceMetric.UseFeatureLayout;
+        var previousScalar = PatchSsdDistanceMetric.ForceScalar;
+        try
+        {
+            PatchSsdDistanceMetric.ForceScalar = false;
+            foreach (var width in new[] { 16, 32, 64 })
+            foreach (var layout in new[] { false, true })
+            {
+                PatchSsdDistanceMetric.ForceVectorBytes = width;
+                PatchSsdDistanceMetric.UseFeatureLayout = layout;
+                Assert.That(PatchSsdDistanceMetric.CalculateImageDistance(
+                                source, center, center, target, center, center, radius),
+                            Is.EqualTo(expected), $"radius={radius} width={width} features={layout}");
+            }
+        }
+        finally
+        {
+            PatchSsdDistanceMetric.ForceVectorBytes = previousWidth;
+            PatchSsdDistanceMetric.UseFeatureLayout = previousLayout;
+            PatchSsdDistanceMetric.ForceScalar = previousScalar;
+        }
+    }
+
     [Test]
     public void InpaintOutputMatchesForcedScalar()
     {
