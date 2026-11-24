@@ -29,6 +29,8 @@ internal sealed class Direct3D12Prototype : IDisposable
     private readonly ID3D12CommandQueue          _commandQueue;
     private readonly ID3D12RootSignature         _squareDifferenceRootSignature;
     private readonly ID3D12PipelineState         _squareDifferencePipelineState;
+    private readonly ID3D12RootSignature         _patchDistanceRootSignature;
+    private readonly ID3D12PipelineState         _patchDistancePipelineState;
     private readonly ID3D12Fence                 _fence;
     private          ulong                       _nextFenceValue = 1;
     private          int                         _asynchronousFenceWaitCount;
@@ -56,6 +58,14 @@ internal sealed class Direct3D12Prototype : IDisposable
         {
             RootSignature = _squareDifferenceRootSignature,
             ComputeShader = squareDifferenceShader
+        });
+
+        var patchDistanceShader = LoadShader("PatchDistance.dxil");
+        _patchDistanceRootSignature = _device.CreateRootSignature(patchDistanceShader);
+        _patchDistancePipelineState = _device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = _patchDistanceRootSignature,
+            ComputeShader = patchDistanceShader
         });
 
         _fence = _device.CreateFence(0, FenceFlags.None);
@@ -121,6 +131,39 @@ internal sealed class Direct3D12Prototype : IDisposable
         }
     }
 
+    /// <summary>
+    /// 批量计算候选 patch 的图像 SSD 距离。invalid 缓冲已经合并 hole mask 与 global mask。<br/>
+    /// Calculates image SSD distances for a batch of patch pairs. The invalid buffers already merge
+    /// the hole and global masks.
+    /// </summary>
+    internal async Task<int[]> CalculatePatchDistancesAsync(
+        ReadOnlyMemory<byte> sourcePixels, ReadOnlyMemory<byte> sourceInvalid,
+        ReadOnlyMemory<byte> targetPixels, ReadOnlyMemory<byte> targetInvalid,
+        int width, int height, ReadOnlyMemory<PatchPair> pairs, int patchRadius,
+        CancellationToken cancellationToken = default)
+    {
+        ValidatePatchDistanceInputs(sourcePixels, sourceInvalid, targetPixels, targetInvalid, width, height,
+                                    patchRadius);
+        if (pairs.IsEmpty)
+        {
+            return [];
+        }
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            cancellationToken.ThrowIfCancellationRequested();
+            return await ExecutePatchDistancesAsync(sourcePixels, sourceInvalid, targetPixels, targetInvalid,
+                                                    width, height, pairs, patchRadius, cancellationToken)
+               .ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     private async Task<uint[]> ExecuteSquareDifferencesAsync(ReadOnlyMemory<byte> left, ReadOnlyMemory<byte> right,
                                                              CancellationToken cancellationToken)
     {
@@ -170,6 +213,146 @@ internal sealed class Direct3D12Prototype : IDisposable
         readbackBuffer.Map<uint>(0, result.Length).CopyTo(result);
         readbackBuffer.Unmap(0);
         return result;
+    }
+
+    private async Task<int[]> ExecutePatchDistancesAsync(
+        ReadOnlyMemory<byte> sourcePixels, ReadOnlyMemory<byte> sourceInvalid,
+        ReadOnlyMemory<byte> targetPixels, ReadOnlyMemory<byte> targetInvalid,
+        int width, int height, ReadOnlyMemory<PatchPair> pairs, int patchRadius,
+        CancellationToken cancellationToken)
+    {
+        var pairBytes       = MemoryMarshal.AsBytes(pairs.Span).ToArray();
+        var outputByteCount = checked((ulong)pairs.Length * sizeof(uint) * 2);
+
+        using var sourcePixelsBuffer = CreateUploadBuffer(sourcePixels.Span, AlignToFour(sourcePixels.Length));
+        using var sourceInvalidBuffer = CreateUploadBuffer(sourceInvalid.Span, AlignToFour(sourceInvalid.Length));
+        using var targetPixelsBuffer = CreateUploadBuffer(targetPixels.Span, AlignToFour(targetPixels.Length));
+        using var targetInvalidBuffer = CreateUploadBuffer(targetInvalid.Span, AlignToFour(targetInvalid.Length));
+        using var pairsBuffer = CreateUploadBuffer(pairBytes, AlignToFour(pairBytes.Length));
+        using var outputBuffer = CreateBuffer(outputByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                              ResourceFlags.AllowUnorderedAccess);
+        using var readbackBuffer =
+            CreateBuffer(outputByteCount, HeapType.Readback, ResourceStates.CopyDest, ResourceFlags.None);
+        using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+        using var commandList =
+            _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                                                                  _patchDistancePipelineState);
+
+        commandList.SetComputeRootSignature(_patchDistanceRootSignature);
+        commandList.SetComputeRootShaderResourceView(0, sourcePixelsBuffer.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(1, sourceInvalidBuffer.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(2, targetPixelsBuffer.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(3, targetInvalidBuffer.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(4, pairsBuffer.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(5, outputBuffer.GPUVirtualAddress);
+        var (groupCountX, groupCountY, dispatchWidth) = GetDispatchDimensions(pairs.Length);
+        commandList.SetComputeRoot32BitConstant(6, (uint)pairs.Length, 0);
+        commandList.SetComputeRoot32BitConstant(6, (uint)width, 1);
+        commandList.SetComputeRoot32BitConstant(6, (uint)height, 2);
+        commandList.SetComputeRoot32BitConstant(6, (uint)patchRadius, 3);
+        commandList.SetComputeRoot32BitConstant(6, (uint)dispatchWidth, 4);
+        commandList.Dispatch((uint)groupCountX, (uint)groupCountY, 1);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(outputBuffer, ResourceStates.UnorderedAccess,
+                                                                     ResourceStates.CopySource));
+        commandList.CopyBufferRegion(readbackBuffer, 0, outputBuffer, 0, outputByteCount);
+        commandList.Close();
+
+        _commandQueue.ExecuteCommandList(commandList);
+        var fenceValue = _nextFenceValue++;
+        _commandQueue.Signal(_fence, fenceValue).CheckError();
+        if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+        {
+            Interlocked.Increment(ref _asynchronousFenceWaitCount);
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var accumulators = new uint[checked(pairs.Length * 2)];
+        readbackBuffer.Map<uint>(0, accumulators.Length).CopyTo(accumulators);
+        readbackBuffer.Unmap(0);
+
+        var result      = new int[pairs.Length];
+        var patchWidth  = 2L * patchRadius + 1;
+        var patchPixels = patchWidth * patchWidth;
+        for (var index = 0; index < result.Length; index++)
+        {
+            var squaredSum = accumulators[index * 2];
+            var validPixels = accumulators[index * 2 + 1];
+            double distance = SsdScale * (patchPixels - validPixels) + squaredSum;
+            distance /= SsdScale;
+            var value = (int)(DistanceScale * distance / patchPixels);
+            result[index] = value is < 0 or > DistanceScale ? DistanceScale : value;
+        }
+
+        return result;
+    }
+
+    private static void ValidatePatchDistanceInputs(
+        ReadOnlyMemory<byte> sourcePixels, ReadOnlyMemory<byte> sourceInvalid,
+        ReadOnlyMemory<byte> targetPixels, ReadOnlyMemory<byte> targetInvalid,
+        int width, int height, int patchRadius)
+    {
+        if (width <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(width), width, "Width must be positive.");
+        }
+
+        if (height <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(height), height, "Height must be positive.");
+        }
+
+        int pixelCount;
+        int imageByteCount;
+        try
+        {
+            pixelCount     = checked(width * height);
+            imageByteCount = checked(pixelCount * 3);
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentOutOfRangeException(nameof(width), "The supplied dimensions are too large.");
+        }
+
+        if (sourcePixels.Length != imageByteCount)
+        {
+            throw new ArgumentException($"The source image must contain exactly {imageByteCount} bytes.",
+                                        nameof(sourcePixels));
+        }
+
+        if (targetPixels.Length != imageByteCount)
+        {
+            throw new ArgumentException($"The target image must contain exactly {imageByteCount} bytes.",
+                                        nameof(targetPixels));
+        }
+
+        if (sourceInvalid.Length != pixelCount)
+        {
+            throw new ArgumentException($"The source invalid mask must contain exactly {pixelCount} bytes.",
+                                        nameof(sourceInvalid));
+        }
+
+        if (targetInvalid.Length != pixelCount)
+        {
+            throw new ArgumentException($"The target invalid mask must contain exactly {pixelCount} bytes.",
+                                        nameof(targetInvalid));
+        }
+
+        ValidatePatchRadius(patchRadius);
+    }
+
+    private static void ValidatePatchRadius(int patchRadius)
+    {
+        if (patchRadius < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(patchRadius), patchRadius,
+                                                  "The patch radius cannot be negative.");
+        }
+
+        if (patchRadius > MaximumPatchRadius)
+        {
+            throw new ArgumentOutOfRangeException(nameof(patchRadius), patchRadius,
+                "The phase-2 prototype requires the valid-pixel SSD accumulator to fit in 32 bits.");
+        }
     }
 
     private ID3D12Resource CreateUploadBuffer(ReadOnlySpan<byte> data, ulong size)
@@ -260,6 +443,8 @@ internal sealed class Direct3D12Prototype : IDisposable
             {
                 _disposed = true;
                 _fence.Dispose();
+                _patchDistancePipelineState.Dispose();
+                _patchDistanceRootSignature.Dispose();
                 _squareDifferencePipelineState.Dispose();
                 _squareDifferenceRootSignature.Dispose();
                 _commandQueue.Dispose();

@@ -18,7 +18,9 @@
 	</ItemGroup>
 
 	<ItemGroup>
+		<EmbeddedResource Include="Shaders\PatchDistance.dxil" />
 		<EmbeddedResource Include="Shaders\SquareDifference.dxil" />
+		<None Include="Shaders\PatchDistance.hlsl" />
 		<None Include="Shaders\SquareDifference.hlsl" />
 	</ItemGroup>
 
