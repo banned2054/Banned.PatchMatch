@@ -18,18 +18,22 @@
 	</ItemGroup>
 
 	<ItemGroup>
+		<EmbeddedResource Include="Shaders\FixedPointMaximize.dxil" />
 		<EmbeddedResource Include="Shaders\FixedPointVote.dxil" />
 		<EmbeddedResource Include="Shaders\NearestNeighborInitialization.dxil" />
 		<EmbeddedResource Include="Shaders\NearestNeighborMinimization.dxil" />
 		<EmbeddedResource Include="Shaders\PatchDistance.dxil" />
 		<EmbeddedResource Include="Shaders\SquareDifference.dxil" />
 		<EmbeddedResource Include="Shaders\SetIdentityLinks.dxil" />
+		<EmbeddedResource Include="Shaders\UnpackRgb.dxil" />
+		<None Include="Shaders\FixedPointMaximize.hlsl" />
 		<None Include="Shaders\FixedPointVote.hlsl" />
 		<None Include="Shaders\NearestNeighborInitialization.hlsl" />
 		<None Include="Shaders\NearestNeighborMinimization.hlsl" />
 		<None Include="Shaders\PatchDistance.hlsl" />
 		<None Include="Shaders\SquareDifference.hlsl" />
 		<None Include="Shaders\SetIdentityLinks.hlsl" />
+		<None Include="Shaders\UnpackRgb.hlsl" />
 	</ItemGroup>
 
 	<ItemGroup>

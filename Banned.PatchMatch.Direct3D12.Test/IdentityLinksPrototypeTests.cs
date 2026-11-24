@@ -50,6 +50,41 @@ public sealed class IdentityLinksPrototypeTests
         }
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public async Task InPlaceMaximizationMatchesStandaloneReadback(bool useWarp)
+    {
+        const int width = 19;
+        const int height = 13;
+        const int radius = 2;
+        var random = new Random(useWarp ? 14_141 : 13_131);
+        var pixels = RandomBytes(random, width * height * 3);
+        var sourceMask = RandomMask(random, width * height, 0.08f);
+        var targetMask = new byte[sourceMask.Length];
+        using var prototype = CreatePrototype(useWarp);
+        using var workset = await prototype.CreatePatchWorksetAsync(
+            pixels, sourceMask, ReadOnlyMemory<byte>.Empty,
+            pixels, targetMask, ReadOnlyMemory<byte>.Empty, width, height);
+        using var forward = await prototype.InitializeNearestNeighborFieldAsync(
+            workset, radius, randomSeed : 1212, sourceToTarget : true);
+        using var reverse = await prototype.InitializeNearestNeighborFieldAsync(
+            workset, radius, randomSeed : 3434, sourceToTarget : false);
+        await prototype.SetIdentityLinksAsync(forward, reverse);
+        await prototype.MinimizeNearestNeighborFieldAsync(
+            forward, passCount : 1, randomSeed : 5656, conditionalSkip : true);
+        await prototype.MinimizeNearestNeighborFieldAsync(
+            reverse, passCount : 1, randomSeed : 7878, conditionalSkip : true);
+        using var votes = await prototype.CreateFixedPointVoteBufferAsync(workset);
+        await prototype.AccumulateFixedPointVotesAsync(forward, votes);
+        await prototype.AccumulateFixedPointVotesAsync(reverse, votes);
+        var expected = await prototype.MaximizeFixedPointVotesAsync(votes);
+
+        await prototype.MaximizeFixedPointVotesInPlaceAsync(votes);
+        var actual = await prototype.ReadTargetPixelsAsync(workset);
+
+        Assert.That(actual, Is.EqualTo(expected));
+    }
+
     private static bool ContainsMask(
         byte[] mask, byte[] globalMask, int width, int height, int centerY, int centerX, int radius)
     {

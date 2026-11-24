@@ -39,6 +39,10 @@ internal sealed class Direct3D12Prototype : IDisposable
     private readonly ID3D12PipelineState         _fixedPointVotePipelineState;
     private readonly ID3D12RootSignature         _setIdentityLinksRootSignature;
     private readonly ID3D12PipelineState         _setIdentityLinksPipelineState;
+    private readonly ID3D12RootSignature         _fixedPointMaximizeRootSignature;
+    private readonly ID3D12PipelineState         _fixedPointMaximizePipelineState;
+    private readonly ID3D12RootSignature         _unpackRgbRootSignature;
+    private readonly ID3D12PipelineState         _unpackRgbPipelineState;
     private readonly ID3D12Resource              _similarityWeightsBuffer;
     private readonly ID3D12Fence                 _fence;
     private          ulong                       _nextFenceValue = 1;
@@ -111,6 +115,22 @@ internal sealed class Direct3D12Prototype : IDisposable
         {
             RootSignature = _setIdentityLinksRootSignature,
             ComputeShader = setIdentityLinksShader
+        });
+
+        var fixedPointMaximizeShader = LoadShader("FixedPointMaximize.dxil");
+        _fixedPointMaximizeRootSignature = _device.CreateRootSignature(fixedPointMaximizeShader);
+        _fixedPointMaximizePipelineState = _device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = _fixedPointMaximizeRootSignature,
+            ComputeShader = fixedPointMaximizeShader
+        });
+
+        var unpackRgbShader = LoadShader("UnpackRgb.dxil");
+        _unpackRgbRootSignature = _device.CreateRootSignature(unpackRgbShader);
+        _unpackRgbPipelineState = _device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = _unpackRgbRootSignature,
+            ComputeShader = unpackRgbShader
         });
 
         var similarityWeights = BuildSimilarityWeights();
@@ -440,6 +460,73 @@ internal sealed class Direct3D12Prototype : IDisposable
             votes.ThrowIfDisposed();
             cancellationToken.ThrowIfCancellationRequested();
             return await ExecuteReadFixedPointVotesAsync(votes, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 在 GPU 上最大化定点投票并回读紧密排列的 RGB 像素。无投票或 global-mask 像素保留 target 值。<br/>
+    /// Maximizes fixed-point votes on the GPU and reads back tightly packed RGB pixels. Pixels with no votes
+    /// or a global mask preserve their target value.
+    /// </summary>
+    internal async Task<byte[]> MaximizeFixedPointVotesAsync(
+        Direct3D12FixedPointVoteBuffer votes, CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedVoteBuffer(votes);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            votes.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            return await ExecuteMaximizeFixedPointVotesAsync(votes, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 在 GPU 上最大化定点投票，并将紧密排列的 RGB 结果原地写回工作集 target。<br/>
+    /// Maximizes fixed-point votes on the GPU and writes the tightly packed RGB result back to the workset target.
+    /// </summary>
+    internal async Task MaximizeFixedPointVotesInPlaceAsync(
+        Direct3D12FixedPointVoteBuffer votes, CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedVoteBuffer(votes);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            votes.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            await ExecuteMaximizeFixedPointVotesInPlaceAsync(votes, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 回读工作集当前 target RGB，仅供阶段 2 原型验证使用。<br/>
+    /// Reads the workset's current target RGB for phase-2 prototype validation.
+    /// </summary>
+    internal async Task<byte[]> ReadTargetPixelsAsync(
+        Direct3D12PatchWorkset workset, CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedWorkset(workset);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            workset.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            return await ExecuteReadTargetPixelsAsync(workset, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -1028,6 +1115,149 @@ internal sealed class Direct3D12Prototype : IDisposable
         return result;
     }
 
+    private async Task<byte[]> ExecuteMaximizeFixedPointVotesAsync(
+        Direct3D12FixedPointVoteBuffer votes, CancellationToken cancellationToken)
+    {
+        var workset = votes.Workset;
+        var pixelCount = checked(workset.Width * workset.Height);
+        var outputByteCount = checked((ulong)pixelCount * sizeof(uint));
+        using var output = CreateBuffer(outputByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                        ResourceFlags.AllowUnorderedAccess);
+        using var readback = CreateBuffer(outputByteCount, HeapType.Readback, ResourceStates.CopyDest,
+                                          ResourceFlags.None);
+        using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+        using var commandList =
+            _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                _fixedPointMaximizePipelineState);
+        commandList.SetComputeRootSignature(_fixedPointMaximizeRootSignature);
+        commandList.SetComputeRootShaderResourceView(0, workset.TargetPixels.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(1, workset.TargetGlobal.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(2, votes.Buffer.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(3, output.GPUVirtualAddress);
+        var (groupCountX, groupCountY, dispatchWidth) = GetDispatchDimensions(pixelCount);
+        commandList.SetComputeRoot32BitConstant(4, (uint)workset.Width, 0);
+        commandList.SetComputeRoot32BitConstant(4, (uint)workset.Height, 1);
+        commandList.SetComputeRoot32BitConstant(4, (uint)dispatchWidth, 2);
+        commandList.Dispatch((uint)groupCountX, (uint)groupCountY, 1);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            output, ResourceStates.UnorderedAccess, ResourceStates.CopySource));
+        commandList.CopyBufferRegion(readback, 0, output, 0, outputByteCount);
+        commandList.Close();
+
+        _commandQueue.ExecuteCommandList(commandList);
+        var fenceValue = _nextFenceValue++;
+        _commandQueue.Signal(_fence, fenceValue).CheckError();
+        if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+        {
+            Interlocked.Increment(ref _asynchronousFenceWaitCount);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var packed = new uint[pixelCount];
+        readback.Map<uint>(0, pixelCount).CopyTo(packed);
+        readback.Unmap(0);
+        var result = new byte[checked(pixelCount * 3)];
+        for (var pixel = 0; pixel < pixelCount; pixel++)
+        {
+            var outputOffset = pixel * 3;
+            result[outputOffset]     = (byte)packed[pixel];
+            result[outputOffset + 1] = (byte)(packed[pixel] >> 8);
+            result[outputOffset + 2] = (byte)(packed[pixel] >> 16);
+        }
+
+        return result;
+    }
+
+    private async Task ExecuteMaximizeFixedPointVotesInPlaceAsync(
+        Direct3D12FixedPointVoteBuffer votes, CancellationToken cancellationToken)
+    {
+        var workset = votes.Workset;
+        var pixelCount = checked(workset.Width * workset.Height);
+        var imageByteCount = checked(pixelCount * 3);
+        var packedByteCount = checked((ulong)pixelCount * sizeof(uint));
+        using var packedOutput = CreateBuffer(packedByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                              ResourceFlags.AllowUnorderedAccess);
+        using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+        using var commandList =
+            _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                _fixedPointMaximizePipelineState);
+
+        commandList.SetComputeRootSignature(_fixedPointMaximizeRootSignature);
+        commandList.SetComputeRootShaderResourceView(0, workset.TargetPixels.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(1, workset.TargetGlobal.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(2, votes.Buffer.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(3, packedOutput.GPUVirtualAddress);
+        var (maximizeGroupCountX, maximizeGroupCountY, maximizeDispatchWidth) =
+            GetDispatchDimensions(pixelCount);
+        commandList.SetComputeRoot32BitConstant(4, (uint)workset.Width, 0);
+        commandList.SetComputeRoot32BitConstant(4, (uint)workset.Height, 1);
+        commandList.SetComputeRoot32BitConstant(4, (uint)maximizeDispatchWidth, 2);
+        commandList.Dispatch((uint)maximizeGroupCountX, (uint)maximizeGroupCountY, 1);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(packedOutput));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            packedOutput, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            workset.TargetPixels, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess));
+
+        commandList.SetPipelineState(_unpackRgbPipelineState);
+        commandList.SetComputeRootSignature(_unpackRgbRootSignature);
+        commandList.SetComputeRootShaderResourceView(0, packedOutput.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(1, workset.TargetPixels.GPUVirtualAddress);
+        var outputWordCount = checked((imageByteCount + sizeof(uint) - 1) / sizeof(uint));
+        var (unpackGroupCountX, unpackGroupCountY, unpackDispatchWidth) =
+            GetDispatchDimensions(outputWordCount);
+        commandList.SetComputeRoot32BitConstant(2, (uint)imageByteCount, 0);
+        commandList.SetComputeRoot32BitConstant(2, (uint)unpackDispatchWidth, 1);
+        commandList.Dispatch((uint)unpackGroupCountX, (uint)unpackGroupCountY, 1);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(workset.TargetPixels));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            workset.TargetPixels, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+        commandList.Close();
+
+        _commandQueue.ExecuteCommandList(commandList);
+        var fenceValue = _nextFenceValue++;
+        _commandQueue.Signal(_fence, fenceValue).CheckError();
+        if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+        {
+            Interlocked.Increment(ref _asynchronousFenceWaitCount);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    private async Task<byte[]> ExecuteReadTargetPixelsAsync(
+        Direct3D12PatchWorkset workset, CancellationToken cancellationToken)
+    {
+        var imageByteCount = checked(workset.Width * workset.Height * 3);
+        var alignedByteCount = AlignToFour(imageByteCount);
+        using var readback = CreateBuffer(alignedByteCount, HeapType.Readback, ResourceStates.CopyDest,
+                                          ResourceFlags.None);
+        using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+        using var commandList =
+            _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                _unpackRgbPipelineState);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            workset.TargetPixels, ResourceStates.NonPixelShaderResource, ResourceStates.CopySource));
+        commandList.CopyBufferRegion(readback, 0, workset.TargetPixels, 0, alignedByteCount);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            workset.TargetPixels, ResourceStates.CopySource, ResourceStates.NonPixelShaderResource));
+        commandList.Close();
+
+        _commandQueue.ExecuteCommandList(commandList);
+        var fenceValue = _nextFenceValue++;
+        _commandQueue.Signal(_fence, fenceValue).CheckError();
+        if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+        {
+            Interlocked.Increment(ref _asynchronousFenceWaitCount);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var result = new byte[imageByteCount];
+        readback.Map<byte>(0, imageByteCount).CopyTo(result);
+        readback.Unmap(0);
+        return result;
+    }
+
     private static ulong CombineAtomicLanes(uint low, uint high) => ((ulong)high << 32) | low;
 
     internal static ulong GetWorstCaseFixedPointChannelSum(int pixelCount, int fieldCount)
@@ -1388,6 +1618,10 @@ internal sealed class Direct3D12Prototype : IDisposable
                 _disposed = true;
                 _fence.Dispose();
                 _similarityWeightsBuffer.Dispose();
+                _unpackRgbPipelineState.Dispose();
+                _unpackRgbRootSignature.Dispose();
+                _fixedPointMaximizePipelineState.Dispose();
+                _fixedPointMaximizeRootSignature.Dispose();
                 _setIdentityLinksPipelineState.Dispose();
                 _setIdentityLinksRootSignature.Dispose();
                 _fixedPointVotePipelineState.Dispose();
