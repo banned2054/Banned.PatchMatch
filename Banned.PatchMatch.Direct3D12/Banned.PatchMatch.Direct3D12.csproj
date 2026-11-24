@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFrameworks>net10.0;net9.0;net8.0</TargetFrameworks>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<IsAotCompatible>true</IsAotCompatible>
+		<IsPackable>false</IsPackable>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Vortice.Direct3D12" Version="3.8.3" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\Banned.PatchMatch\Banned.PatchMatch.csproj" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<EmbeddedResource Include="Shaders\SquareDifference.dxil" />
+		<None Include="Shaders\SquareDifference.hlsl" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<InternalsVisibleTo Include="Banned.PatchMatch.Direct3D12.AotSmoke" />
+		<InternalsVisibleTo Include="Banned.PatchMatch.Direct3D12.Test" />
+	</ItemGroup>
+
+</Project>
