@@ -45,6 +45,8 @@ internal sealed class Direct3D12Prototype : IDisposable
     private readonly ID3D12PipelineState         _unpackRgbPipelineState;
     private readonly ID3D12RootSignature         _downsampleRootSignature;
     private readonly ID3D12PipelineState         _downsamplePipelineState;
+    private readonly ID3D12RootSignature         _upsampleTargetRootSignature;
+    private readonly ID3D12PipelineState         _upsampleTargetPipelineState;
     private readonly ID3D12Resource              _similarityWeightsBuffer;
     private readonly ID3D12Fence                 _fence;
     private          ulong                       _nextFenceValue = 1;
@@ -141,6 +143,14 @@ internal sealed class Direct3D12Prototype : IDisposable
         {
             RootSignature = _downsampleRootSignature,
             ComputeShader = downsampleShader
+        });
+
+        var upsampleTargetShader = LoadShader("UpsampleTarget.dxil");
+        _upsampleTargetRootSignature = _device.CreateRootSignature(upsampleTargetShader);
+        _upsampleTargetPipelineState = _device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = _upsampleTargetRootSignature,
+            ComputeShader = upsampleTargetShader
         });
 
         var similarityWeights = BuildSimilarityWeights();
@@ -300,6 +310,41 @@ internal sealed class Direct3D12Prototype : IDisposable
             coarse.ThrowIfDisposed();
             cancellationToken.ThrowIfCancellationRequested();
             return await ExecuteCreateDownsampledPatchWorksetAsync(coarse, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 把粗层 target 按最近邻上采样到相邻细层，原地改写细层的 target 半边：粗层对应像素是孔洞或被全局排除时细层像素
+    /// 保持 0，否则复制粗层 target 像素；invalid 是这些粗层导出的孔洞并上细层 source 的 global，global 整体换成
+    /// 细层 source 的 global。<br/>
+    /// Nearest-neighbor upsamples the coarse target into the adjacent fine level, rewriting the fine target
+    /// half in place: pixels whose coarse pixel is a hole or globally excluded keep 0 and all others copy the
+    /// coarse target pixel; invalid merges those coarse-derived holes with the fine source's global mask, and
+    /// the global mask is replaced wholesale by the fine source's.
+    /// </summary>
+    internal async Task UpsampleTargetAsync(
+        Direct3D12PatchWorkset coarse, Direct3D12PatchWorkset fine, CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedWorkset(coarse);
+        ValidateOwnedWorkset(fine);
+        if (fine.Width / 2 != coarse.Width || fine.Height / 2 != coarse.Height)
+        {
+            throw new ArgumentException("The fine workset must be the next finer pyramid level (2c or 2c + 1 pixels).",
+                                        nameof(fine));
+        }
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            coarse.ThrowIfDisposed();
+            fine.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            await ExecuteUpsampleTargetAsync(coarse, fine, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -1485,6 +1530,61 @@ internal sealed class Direct3D12Prototype : IDisposable
         }
     }
 
+    private async Task ExecuteUpsampleTargetAsync(
+        Direct3D12PatchWorkset coarse, Direct3D12PatchWorkset fine, CancellationToken cancellationToken)
+    {
+        var pixelCount     = checked(fine.Width * fine.Height);
+        var imageWordCount = checked((int)(AlignToFour(checked(pixelCount * 3)) / sizeof(uint)));
+        var maskWordCount  = checked((int)(AlignToFour(pixelCount) / sizeof(uint)));
+        using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+        using var commandList =
+            _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                _upsampleTargetPipelineState);
+
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            fine.TargetPixels, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            fine.TargetInvalid, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            fine.TargetGlobal, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess));
+
+        commandList.SetComputeRootSignature(_upsampleTargetRootSignature);
+        commandList.SetComputeRootShaderResourceView(0, coarse.TargetPixels.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(1, coarse.TargetInvalid.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(2, coarse.TargetGlobal.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(3, fine.SourceGlobal.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(4, fine.TargetPixels.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(5, fine.TargetInvalid.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(6, fine.TargetGlobal.GPUVirtualAddress);
+        var (groupCountX, groupCountY, dispatchWidth) = GetDispatchDimensions(imageWordCount + maskWordCount);
+        commandList.SetComputeRoot32BitConstant(7, (uint)coarse.Width, 0);
+        commandList.SetComputeRoot32BitConstant(7, (uint)coarse.Height, 1);
+        commandList.SetComputeRoot32BitConstant(7, (uint)fine.Width, 2);
+        commandList.SetComputeRoot32BitConstant(7, (uint)fine.Height, 3);
+        commandList.SetComputeRoot32BitConstant(7, (uint)dispatchWidth, 4);
+        commandList.Dispatch((uint)groupCountX, (uint)groupCountY, 1);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(fine.TargetPixels));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(fine.TargetInvalid));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(fine.TargetGlobal));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            fine.TargetPixels, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            fine.TargetInvalid, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            fine.TargetGlobal, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+        commandList.Close();
+
+        _commandQueue.ExecuteCommandList(commandList);
+        var fenceValue = _nextFenceValue++;
+        _commandQueue.Signal(_fence, fenceValue).CheckError();
+        if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+        {
+            Interlocked.Increment(ref _asynchronousFenceWaitCount);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
     private async Task<PatchWorksetSnapshot> ExecuteReadPatchWorksetAsync(
         Direct3D12PatchWorkset workset, CancellationToken cancellationToken)
     {
@@ -1922,6 +2022,8 @@ internal sealed class Direct3D12Prototype : IDisposable
                 _disposed = true;
                 _fence.Dispose();
                 _similarityWeightsBuffer.Dispose();
+                _upsampleTargetPipelineState.Dispose();
+                _upsampleTargetRootSignature.Dispose();
                 _downsamplePipelineState.Dispose();
                 _downsampleRootSignature.Dispose();
                 _unpackRgbPipelineState.Dispose();

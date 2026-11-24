@@ -27,6 +27,7 @@
 		<EmbeddedResource Include="Shaders\SquareDifference.dxil" />
 		<EmbeddedResource Include="Shaders\SetIdentityLinks.dxil" />
 		<EmbeddedResource Include="Shaders\UnpackRgb.dxil" />
+		<EmbeddedResource Include="Shaders\UpsampleTarget.dxil" />
 		<None Include="Shaders\Downsample.hlsl" />
 		<None Include="Shaders\FixedPointMaximize.hlsl" />
 		<None Include="Shaders\FixedPointVote.hlsl" />
@@ -36,6 +37,7 @@
 		<None Include="Shaders\SquareDifference.hlsl" />
 		<None Include="Shaders\SetIdentityLinks.hlsl" />
 		<None Include="Shaders\UnpackRgb.hlsl" />
+		<None Include="Shaders\UpsampleTarget.hlsl" />
 	</ItemGroup>
 
 	<ItemGroup>
