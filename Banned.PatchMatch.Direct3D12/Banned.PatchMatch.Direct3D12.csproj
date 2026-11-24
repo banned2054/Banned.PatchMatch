@@ -19,9 +19,11 @@
 
 	<ItemGroup>
 		<EmbeddedResource Include="Shaders\NearestNeighborInitialization.dxil" />
+		<EmbeddedResource Include="Shaders\NearestNeighborMinimization.dxil" />
 		<EmbeddedResource Include="Shaders\PatchDistance.dxil" />
 		<EmbeddedResource Include="Shaders\SquareDifference.dxil" />
 		<None Include="Shaders\NearestNeighborInitialization.hlsl" />
+		<None Include="Shaders\NearestNeighborMinimization.hlsl" />
 		<None Include="Shaders\PatchDistance.hlsl" />
 		<None Include="Shaders\SquareDifference.hlsl" />
 	</ItemGroup>

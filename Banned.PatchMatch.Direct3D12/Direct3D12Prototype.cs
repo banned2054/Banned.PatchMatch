@@ -33,6 +33,8 @@ internal sealed class Direct3D12Prototype : IDisposable
     private readonly ID3D12PipelineState         _patchDistancePipelineState;
     private readonly ID3D12RootSignature         _nearestNeighborInitializationRootSignature;
     private readonly ID3D12PipelineState         _nearestNeighborInitializationPipelineState;
+    private readonly ID3D12RootSignature         _nearestNeighborMinimizationRootSignature;
+    private readonly ID3D12PipelineState         _nearestNeighborMinimizationPipelineState;
     private readonly ID3D12Fence                 _fence;
     private          ulong                       _nextFenceValue = 1;
     private          int                         _asynchronousFenceWaitCount;
@@ -78,6 +80,16 @@ internal sealed class Direct3D12Prototype : IDisposable
             {
                 RootSignature = _nearestNeighborInitializationRootSignature,
                 ComputeShader = nearestNeighborInitializationShader
+            });
+
+        var nearestNeighborMinimizationShader = LoadShader("NearestNeighborMinimization.dxil");
+        _nearestNeighborMinimizationRootSignature =
+            _device.CreateRootSignature(nearestNeighborMinimizationShader);
+        _nearestNeighborMinimizationPipelineState =
+            _device.CreateComputePipelineState(new ComputePipelineStateDescription
+            {
+                RootSignature = _nearestNeighborMinimizationRootSignature,
+                ComputeShader = nearestNeighborMinimizationShader
             });
 
         _fence = _device.CreateFence(0, FenceFlags.None);
@@ -232,6 +244,44 @@ internal sealed class Direct3D12Prototype : IDisposable
             return await ExecuteInitializeNearestNeighborFieldAsync(workset, patchRadius, randomSeed,
                                                                      sourceToTarget, cancellationToken)
                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 使用红黑棋盘并行传播和随机搜索原地最小化最近邻场。每个 pass 包含正向与反向扫描语义；
+    /// 同色像素只依赖异色轴向邻居，两色 dispatch 之间使用 UAV 屏障。<br/>
+    /// Minimizes a nearest-neighbor field in place with red-black parallel propagation and random search.
+    /// Each pass contains forward and backward sweep semantics; same-color pixels only depend on opposite-color
+    /// axial neighbors, with UAV barriers separating color dispatches.
+    /// </summary>
+    internal async Task MinimizeNearestNeighborFieldAsync(
+        Direct3D12NearestNeighborField field, int passCount, uint randomSeed, bool conditionalSkip,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedField(field);
+        if (passCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(passCount), passCount,
+                                                  "The pass count cannot be negative.");
+        }
+
+        if (passCount == 0)
+        {
+            return;
+        }
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            field.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            await ExecuteMinimizeNearestNeighborFieldAsync(field, passCount, randomSeed, conditionalSkip,
+                                                           cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -580,6 +630,80 @@ internal sealed class Direct3D12Prototype : IDisposable
         return links;
     }
 
+    private async Task ExecuteMinimizeNearestNeighborFieldAsync(
+        Direct3D12NearestNeighborField field, int passCount, uint randomSeed, bool conditionalSkip,
+        CancellationToken cancellationToken)
+    {
+        var workset   = field.Workset;
+        var pixelCount = checked(workset.Width * workset.Height);
+        using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+        using var commandList =
+            _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                _nearestNeighborMinimizationPipelineState);
+
+        var sourcePixels  = field.SourceToTarget ? workset.SourcePixels : workset.TargetPixels;
+        var sourceInvalid = field.SourceToTarget ? workset.SourceInvalid : workset.TargetInvalid;
+        var sourceGlobal  = field.SourceToTarget ? workset.SourceGlobal : workset.TargetGlobal;
+        var targetPixels  = field.SourceToTarget ? workset.TargetPixels : workset.SourcePixels;
+        var targetInvalid = field.SourceToTarget ? workset.TargetInvalid : workset.SourceInvalid;
+        var targetGlobal  = field.SourceToTarget ? workset.TargetGlobal : workset.SourceGlobal;
+        var (groupCountX, groupCountY, dispatchWidth) = GetDispatchDimensions(pixelCount);
+
+        commandList.SetComputeRootSignature(_nearestNeighborMinimizationRootSignature);
+        commandList.SetComputeRootShaderResourceView(0, sourcePixels.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(1, sourceInvalid.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(2, sourceGlobal.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(3, targetPixels.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(4, targetInvalid.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(5, targetGlobal.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(6, field.Buffer.GPUVirtualAddress);
+        commandList.SetComputeRoot32BitConstant(7, (uint)workset.Width, 0);
+        commandList.SetComputeRoot32BitConstant(7, (uint)workset.Height, 1);
+        commandList.SetComputeRoot32BitConstant(7, (uint)field.PatchRadius, 2);
+        commandList.SetComputeRoot32BitConstant(7, randomSeed, 3);
+        commandList.SetComputeRoot32BitConstant(7, (uint)dispatchWidth, 4);
+        commandList.SetComputeRoot32BitConstant(7, conditionalSkip ? 1u : 0u, 7);
+        commandList.SetComputeRoot32BitConstant(7, field.SourceToTarget ? 1u : 0u, 8);
+
+        uint sweepIndex = 0;
+        for (var pass = 0; pass < passCount; pass++)
+        {
+            DispatchMinimizationColor(commandList, groupCountX, groupCountY,
+                                      propagationDirection : 1, checkerboardParity : 0, sweepIndex++);
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(field.Buffer));
+            DispatchMinimizationColor(commandList, groupCountX, groupCountY,
+                                      propagationDirection : 1, checkerboardParity : 1, sweepIndex++);
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(field.Buffer));
+            DispatchMinimizationColor(commandList, groupCountX, groupCountY,
+                                      propagationDirection : -1, checkerboardParity : 1, sweepIndex++);
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(field.Buffer));
+            DispatchMinimizationColor(commandList, groupCountX, groupCountY,
+                                      propagationDirection : -1, checkerboardParity : 0, sweepIndex++);
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(field.Buffer));
+        }
+
+        commandList.Close();
+        _commandQueue.ExecuteCommandList(commandList);
+        var fenceValue = _nextFenceValue++;
+        _commandQueue.Signal(_fence, fenceValue).CheckError();
+        if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+        {
+            Interlocked.Increment(ref _asynchronousFenceWaitCount);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    private static void DispatchMinimizationColor(
+        ID3D12GraphicsCommandList commandList, int groupCountX, int groupCountY,
+        int propagationDirection, uint checkerboardParity, uint sweepIndex)
+    {
+        commandList.SetComputeRoot32BitConstant(7, unchecked((uint)propagationDirection), 5);
+        commandList.SetComputeRoot32BitConstant(7, checkerboardParity, 6);
+        commandList.SetComputeRoot32BitConstant(7, sweepIndex, 9);
+        commandList.Dispatch((uint)groupCountX, (uint)groupCountY, 1);
+    }
+
     private static void ValidatePatchDistanceInputs(
         ReadOnlyMemory<byte> sourcePixels, ReadOnlyMemory<byte> sourceInvalid,
         ReadOnlyMemory<byte> targetPixels, ReadOnlyMemory<byte> targetInvalid,
@@ -863,6 +987,8 @@ internal sealed class Direct3D12Prototype : IDisposable
             {
                 _disposed = true;
                 _fence.Dispose();
+                _nearestNeighborMinimizationPipelineState.Dispose();
+                _nearestNeighborMinimizationRootSignature.Dispose();
                 _nearestNeighborInitializationPipelineState.Dispose();
                 _nearestNeighborInitializationRootSignature.Dispose();
                 _patchDistancePipelineState.Dispose();
