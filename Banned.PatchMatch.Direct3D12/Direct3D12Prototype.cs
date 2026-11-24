@@ -35,8 +35,11 @@ internal sealed class Direct3D12Prototype : IDisposable
     private readonly ID3D12PipelineState         _nearestNeighborInitializationPipelineState;
     private readonly ID3D12RootSignature         _nearestNeighborMinimizationRootSignature;
     private readonly ID3D12PipelineState         _nearestNeighborMinimizationPipelineState;
+    private readonly ID3D12RootSignature         _fixedPointVoteRootSignature;
+    private readonly ID3D12PipelineState         _fixedPointVotePipelineState;
     private readonly ID3D12RootSignature         _setIdentityLinksRootSignature;
     private readonly ID3D12PipelineState         _setIdentityLinksPipelineState;
+    private readonly ID3D12Resource              _similarityWeightsBuffer;
     private readonly ID3D12Fence                 _fence;
     private          ulong                       _nextFenceValue = 1;
     private          int                         _asynchronousFenceWaitCount;
@@ -94,6 +97,14 @@ internal sealed class Direct3D12Prototype : IDisposable
                 ComputeShader = nearestNeighborMinimizationShader
             });
 
+        var fixedPointVoteShader = LoadShader("FixedPointVote.dxil");
+        _fixedPointVoteRootSignature = _device.CreateRootSignature(fixedPointVoteShader);
+        _fixedPointVotePipelineState = _device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = _fixedPointVoteRootSignature,
+            ComputeShader = fixedPointVoteShader
+        });
+
         var setIdentityLinksShader = LoadShader("SetIdentityLinks.dxil");
         _setIdentityLinksRootSignature = _device.CreateRootSignature(setIdentityLinksShader);
         _setIdentityLinksPipelineState = _device.CreateComputePipelineState(new ComputePipelineStateDescription
@@ -102,6 +113,10 @@ internal sealed class Direct3D12Prototype : IDisposable
             ComputeShader = setIdentityLinksShader
         });
 
+        var similarityWeights = BuildSimilarityWeights();
+        _similarityWeightsBuffer = CreateUploadBuffer(
+            MemoryMarshal.AsBytes(similarityWeights.AsSpan()),
+            checked((ulong)similarityWeights.Length * sizeof(uint)));
         _fence = _device.CreateFence(0, FenceFlags.None);
     }
 
@@ -318,6 +333,113 @@ internal sealed class Direct3D12Prototype : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             await ExecuteSetIdentityLinksAsync(sourceToTarget, targetToSource, cancellationToken)
                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 创建清零的定点投票缓冲。每个颜色通道和权重使用两个 uint32 原子槽组成 uint64 累加器。<br/>
+    /// Creates a zeroed fixed-point vote buffer. Each color channel and weight uses two uint32 atomic lanes
+    /// forming a uint64 accumulator.
+    /// </summary>
+    internal async Task<Direct3D12FixedPointVoteBuffer> CreateFixedPointVoteBufferAsync(
+        Direct3D12PatchWorkset workset, CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedWorkset(workset);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            workset.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            return await ExecuteCreateFixedPointVoteBufferAsync(workset, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 将一个最近邻场的非上采样投票累加到定点缓冲。正向场只接受孔洞中心，反向场只接受非孔洞中心。<br/>
+    /// Accumulates one nearest-neighbor field's non-upscaled votes into a fixed-point buffer. The forward field
+    /// accepts only hole centers and the reverse field only non-hole centers.
+    /// </summary>
+    internal async Task AccumulateFixedPointVotesAsync(
+        Direct3D12NearestNeighborField field, Direct3D12FixedPointVoteBuffer votes,
+        CancellationToken cancellationToken = default)
+    {
+        await AccumulateFixedPointVotesCoreAsync(field, votes, upscaled : false, cancellationToken)
+           .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 将粗层最近邻场按 2x2 对应关系投票到相邻细层，颜色及像素有效性取自细层原图。<br/>
+    /// Transfers coarse-field votes to the next finer level using 2x2 correspondences and fine source pixels.
+    /// </summary>
+    internal async Task AccumulateUpscaledFixedPointVotesAsync(
+        Direct3D12NearestNeighborField field, Direct3D12FixedPointVoteBuffer votes,
+        CancellationToken cancellationToken = default)
+    {
+        await AccumulateFixedPointVotesCoreAsync(field, votes, upscaled : true, cancellationToken)
+           .ConfigureAwait(false);
+    }
+
+    private async Task AccumulateFixedPointVotesCoreAsync(
+        Direct3D12NearestNeighborField field, Direct3D12FixedPointVoteBuffer votes, bool upscaled,
+        CancellationToken cancellationToken)
+    {
+        ValidateOwnedField(field);
+        ValidateOwnedVoteBuffer(votes);
+        if (upscaled)
+        {
+            if (ReferenceEquals(field.Workset, votes.Workset) ||
+                votes.Workset.Width / 2 != field.Workset.Width ||
+                votes.Workset.Height / 2 != field.Workset.Height)
+            {
+                throw new ArgumentException("The vote buffer must belong to the next finer pyramid level.",
+                                            nameof(votes));
+            }
+        }
+        else if (!ReferenceEquals(field.Workset, votes.Workset))
+        {
+            throw new ArgumentException("The nearest-neighbor field and vote buffer must share a workset.",
+                                        nameof(votes));
+        }
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            field.ThrowIfDisposed();
+            votes.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            await ExecuteAccumulateFixedPointVotesAsync(field, votes, upscaled, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 回读定点投票缓冲，仅供阶段 2 原型差分验证使用。<br/>
+    /// Reads a fixed-point vote buffer for phase-2 prototype differential validation.
+    /// </summary>
+    internal async Task<FixedPointVote[]> ReadFixedPointVotesAsync(
+        Direct3D12FixedPointVoteBuffer votes, CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedVoteBuffer(votes);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            votes.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            return await ExecuteReadFixedPointVotesAsync(votes, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -776,6 +898,173 @@ internal sealed class Direct3D12Prototype : IDisposable
         cancellationToken.ThrowIfCancellationRequested();
     }
 
+    private async Task<Direct3D12FixedPointVoteBuffer> ExecuteCreateFixedPointVoteBufferAsync(
+        Direct3D12PatchWorkset workset, CancellationToken cancellationToken)
+    {
+        var pixelCount = checked(workset.Width * workset.Height);
+        var byteCount = checked((ulong)pixelCount * Direct3D12FixedPointVoteBuffer.BytesPerPixel);
+        ID3D12Resource? buffer = null;
+        try
+        {
+            buffer = CreateBuffer(byteCount, HeapType.Default, ResourceStates.CopyDest,
+                                  ResourceFlags.AllowUnorderedAccess);
+            using var zeroUpload = CreateUploadBuffer(new byte[checked((int)byteCount)], byteCount);
+            using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+            using var commandList =
+                _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                    _fixedPointVotePipelineState);
+            commandList.CopyBufferRegion(buffer, 0, zeroUpload, 0, byteCount);
+            commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+                buffer, ResourceStates.CopyDest, ResourceStates.UnorderedAccess));
+            commandList.Close();
+
+            _commandQueue.ExecuteCommandList(commandList);
+            var fenceValue = _nextFenceValue++;
+            _commandQueue.Signal(_fence, fenceValue).CheckError();
+            if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+            {
+                Interlocked.Increment(ref _asynchronousFenceWaitCount);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            return new Direct3D12FixedPointVoteBuffer(this, workset, buffer);
+        }
+        catch
+        {
+            buffer?.Dispose();
+            throw;
+        }
+    }
+
+    private async Task ExecuteAccumulateFixedPointVotesAsync(
+        Direct3D12NearestNeighborField field, Direct3D12FixedPointVoteBuffer votes,
+        bool upscaled, CancellationToken cancellationToken)
+    {
+        var workset = field.Workset;
+        var pixelCount = checked(workset.Width * workset.Height);
+        var fieldSourceInvalid = field.SourceToTarget ? workset.SourceInvalid : workset.TargetInvalid;
+        var fieldSourceGlobal  = field.SourceToTarget ? workset.SourceGlobal : workset.TargetGlobal;
+        var fieldTargetGlobal  = field.SourceToTarget ? workset.TargetGlobal : workset.SourceGlobal;
+        using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+        using var commandList =
+            _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                _fixedPointVotePipelineState);
+
+        commandList.SetComputeRootSignature(_fixedPointVoteRootSignature);
+        commandList.SetComputeRootShaderResourceView(0, votes.Workset.SourcePixels.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(1, votes.Workset.SourceInvalid.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(2, fieldSourceInvalid.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(3, fieldSourceGlobal.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(4, fieldTargetGlobal.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(5, _similarityWeightsBuffer.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(6, field.Buffer.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(7, votes.Buffer.GPUVirtualAddress);
+        var (groupCountX, groupCountY, dispatchWidth) = GetDispatchDimensions(pixelCount);
+        commandList.SetComputeRoot32BitConstant(8, (uint)workset.Width, 0);
+        commandList.SetComputeRoot32BitConstant(8, (uint)workset.Height, 1);
+        commandList.SetComputeRoot32BitConstant(8, (uint)field.PatchRadius, 2);
+        commandList.SetComputeRoot32BitConstant(8, (uint)dispatchWidth, 3);
+        commandList.SetComputeRoot32BitConstant(8, field.SourceToTarget ? 1u : 0u, 4);
+        commandList.SetComputeRoot32BitConstant(8, (uint)votes.Workset.Width, 5);
+        commandList.SetComputeRoot32BitConstant(8, (uint)votes.Workset.Height, 6);
+        commandList.SetComputeRoot32BitConstant(8, upscaled ? 2u : 1u, 7);
+        commandList.Dispatch((uint)groupCountX, (uint)groupCountY, 1);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(votes.Buffer));
+        commandList.Close();
+
+        _commandQueue.ExecuteCommandList(commandList);
+        var fenceValue = _nextFenceValue++;
+        _commandQueue.Signal(_fence, fenceValue).CheckError();
+        if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+        {
+            Interlocked.Increment(ref _asynchronousFenceWaitCount);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    private async Task<FixedPointVote[]> ExecuteReadFixedPointVotesAsync(
+        Direct3D12FixedPointVoteBuffer votes, CancellationToken cancellationToken)
+    {
+        var pixelCount = checked(votes.Workset.Width * votes.Workset.Height);
+        var rawLength = checked(pixelCount * 8);
+        var byteCount = checked((ulong)rawLength * sizeof(uint));
+        using var readback = CreateBuffer(byteCount, HeapType.Readback, ResourceStates.CopyDest, ResourceFlags.None);
+        using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+        using var commandList =
+            _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                _fixedPointVotePipelineState);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            votes.Buffer, ResourceStates.UnorderedAccess, ResourceStates.CopySource));
+        commandList.CopyBufferRegion(readback, 0, votes.Buffer, 0, byteCount);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            votes.Buffer, ResourceStates.CopySource, ResourceStates.UnorderedAccess));
+        commandList.Close();
+
+        _commandQueue.ExecuteCommandList(commandList);
+        var fenceValue = _nextFenceValue++;
+        _commandQueue.Signal(_fence, fenceValue).CheckError();
+        if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+        {
+            Interlocked.Increment(ref _asynchronousFenceWaitCount);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var raw = new uint[rawLength];
+        readback.Map<uint>(0, rawLength).CopyTo(raw);
+        readback.Unmap(0);
+
+        var result = new FixedPointVote[pixelCount];
+        for (var pixel = 0; pixel < pixelCount; pixel++)
+        {
+            var offset = pixel * 8;
+            result[pixel] = new FixedPointVote(
+                CombineAtomicLanes(raw[offset], raw[offset + 1]),
+                CombineAtomicLanes(raw[offset + 2], raw[offset + 3]),
+                CombineAtomicLanes(raw[offset + 4], raw[offset + 5]),
+                CombineAtomicLanes(raw[offset + 6], raw[offset + 7]));
+        }
+
+        return result;
+    }
+
+    private static ulong CombineAtomicLanes(uint low, uint high) => ((ulong)high << 32) | low;
+
+    internal static ulong GetWorstCaseFixedPointChannelSum(int pixelCount, int fieldCount)
+    {
+        if (pixelCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(pixelCount));
+        }
+
+        if (fieldCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(fieldCount));
+        }
+
+        return checked((ulong)pixelCount * (uint)fieldCount * byte.MaxValue *
+                       Direct3D12FixedPointVoteBuffer.WeightScale);
+    }
+
+    private static uint[] BuildSimilarityWeights()
+    {
+        double[] samples = [1.0, 0.99, 0.96, 0.83, 0.38, 0.11, 0.02, 0.005, 0.0006, 0.0001, 0];
+        var result = new uint[DistanceScale + 1];
+        for (var distance = 0; distance < result.Length; distance++)
+        {
+            var normalized = (double)distance / result.Length;
+            var lowerIndex = (int)(100 * normalized);
+            var upperIndex = lowerIndex + 1;
+            var lower = lowerIndex < samples.Length ? samples[lowerIndex] : 0;
+            var upper = upperIndex < samples.Length ? samples[upperIndex] : 0;
+            var similarity = lower + (((100 * normalized) - lowerIndex) * (upper - lower));
+            result[distance] = checked((uint)Math.Round(
+                similarity * Direct3D12FixedPointVoteBuffer.WeightScale, MidpointRounding.ToEven));
+        }
+
+        return result;
+    }
+
     private static void ValidatePatchDistanceInputs(
         ReadOnlyMemory<byte> sourcePixels, ReadOnlyMemory<byte> sourceInvalid,
         ReadOnlyMemory<byte> targetPixels, ReadOnlyMemory<byte> targetInvalid,
@@ -937,6 +1226,16 @@ internal sealed class Direct3D12Prototype : IDisposable
         }
     }
 
+    private void ValidateOwnedVoteBuffer(Direct3D12FixedPointVoteBuffer votes)
+    {
+        ArgumentNullException.ThrowIfNull(votes);
+        if (!ReferenceEquals(votes.Owner, this))
+        {
+            throw new ArgumentException("The fixed-point vote buffer belongs to a different Direct3D 12 prototype.",
+                                        nameof(votes));
+        }
+    }
+
     private void ValidateIdentityFieldPair(
         Direct3D12NearestNeighborField sourceToTarget, Direct3D12NearestNeighborField targetToSource)
     {
@@ -1060,6 +1359,20 @@ internal sealed class Direct3D12Prototype : IDisposable
         }
     }
 
+    internal void ReleaseFixedPointVoteBuffer(Direct3D12FixedPointVoteBuffer votes)
+    {
+        ValidateOwnedVoteBuffer(votes);
+        _gate.Wait();
+        try
+        {
+            votes.ReleaseResources();
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public void Dispose()
     {
         lock (_disposeSync)
@@ -1074,8 +1387,11 @@ internal sealed class Direct3D12Prototype : IDisposable
             {
                 _disposed = true;
                 _fence.Dispose();
+                _similarityWeightsBuffer.Dispose();
                 _setIdentityLinksPipelineState.Dispose();
                 _setIdentityLinksRootSignature.Dispose();
+                _fixedPointVotePipelineState.Dispose();
+                _fixedPointVoteRootSignature.Dispose();
                 _nearestNeighborMinimizationPipelineState.Dispose();
                 _nearestNeighborMinimizationRootSignature.Dispose();
                 _nearestNeighborInitializationPipelineState.Dispose();
