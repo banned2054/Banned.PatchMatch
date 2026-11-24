@@ -35,6 +35,8 @@ internal sealed class Direct3D12Prototype : IDisposable
     private readonly ID3D12PipelineState         _nearestNeighborInitializationPipelineState;
     private readonly ID3D12RootSignature         _nearestNeighborMinimizationRootSignature;
     private readonly ID3D12PipelineState         _nearestNeighborMinimizationPipelineState;
+    private readonly ID3D12RootSignature         _setIdentityLinksRootSignature;
+    private readonly ID3D12PipelineState         _setIdentityLinksPipelineState;
     private readonly ID3D12Fence                 _fence;
     private          ulong                       _nextFenceValue = 1;
     private          int                         _asynchronousFenceWaitCount;
@@ -91,6 +93,14 @@ internal sealed class Direct3D12Prototype : IDisposable
                 RootSignature = _nearestNeighborMinimizationRootSignature,
                 ComputeShader = nearestNeighborMinimizationShader
             });
+
+        var setIdentityLinksShader = LoadShader("SetIdentityLinks.dxil");
+        _setIdentityLinksRootSignature = _device.CreateRootSignature(setIdentityLinksShader);
+        _setIdentityLinksPipelineState = _device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = _setIdentityLinksRootSignature,
+            ComputeShader = setIdentityLinksShader
+        });
 
         _fence = _device.CreateFence(0, FenceFlags.None);
     }
@@ -282,6 +292,32 @@ internal sealed class Direct3D12Prototype : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             await ExecuteMinimizeNearestNeighborFieldAsync(field, passCount, randomSeed, conditionalSkip,
                                                            cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 对原始 source mask 周围不含孔洞的像素，把两个方向的链接都设为零距离恒等映射。<br/>
+    /// Sets both field directions to zero-distance identity links for pixels whose original source-mask
+    /// neighborhood contains no holes.
+    /// </summary>
+    internal async Task SetIdentityLinksAsync(
+        Direct3D12NearestNeighborField sourceToTarget, Direct3D12NearestNeighborField targetToSource,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateIdentityFieldPair(sourceToTarget, targetToSource);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            sourceToTarget.ThrowIfDisposed();
+            targetToSource.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            await ExecuteSetIdentityLinksAsync(sourceToTarget, targetToSource, cancellationToken)
+               .ConfigureAwait(false);
         }
         finally
         {
@@ -704,6 +740,42 @@ internal sealed class Direct3D12Prototype : IDisposable
         commandList.Dispatch((uint)groupCountX, (uint)groupCountY, 1);
     }
 
+    private async Task ExecuteSetIdentityLinksAsync(
+        Direct3D12NearestNeighborField sourceToTarget, Direct3D12NearestNeighborField targetToSource,
+        CancellationToken cancellationToken)
+    {
+        var workset = sourceToTarget.Workset;
+        var pixelCount = checked(workset.Width * workset.Height);
+        using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+        using var commandList =
+            _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                _setIdentityLinksPipelineState);
+        commandList.SetComputeRootSignature(_setIdentityLinksRootSignature);
+        commandList.SetComputeRootShaderResourceView(0, workset.SourceInvalid.GPUVirtualAddress);
+        commandList.SetComputeRootShaderResourceView(1, workset.SourceGlobal.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(2, sourceToTarget.Buffer.GPUVirtualAddress);
+        commandList.SetComputeRootUnorderedAccessView(3, targetToSource.Buffer.GPUVirtualAddress);
+        var (groupCountX, groupCountY, dispatchWidth) = GetDispatchDimensions(pixelCount);
+        commandList.SetComputeRoot32BitConstant(4, (uint)workset.Width, 0);
+        commandList.SetComputeRoot32BitConstant(4, (uint)workset.Height, 1);
+        commandList.SetComputeRoot32BitConstant(4, (uint)sourceToTarget.PatchRadius, 2);
+        commandList.SetComputeRoot32BitConstant(4, (uint)dispatchWidth, 3);
+        commandList.Dispatch((uint)groupCountX, (uint)groupCountY, 1);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(sourceToTarget.Buffer));
+        commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(targetToSource.Buffer));
+        commandList.Close();
+
+        _commandQueue.ExecuteCommandList(commandList);
+        var fenceValue = _nextFenceValue++;
+        _commandQueue.Signal(_fence, fenceValue).CheckError();
+        if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+        {
+            Interlocked.Increment(ref _asynchronousFenceWaitCount);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
     private static void ValidatePatchDistanceInputs(
         ReadOnlyMemory<byte> sourcePixels, ReadOnlyMemory<byte> sourceInvalid,
         ReadOnlyMemory<byte> targetPixels, ReadOnlyMemory<byte> targetInvalid,
@@ -865,6 +937,21 @@ internal sealed class Direct3D12Prototype : IDisposable
         }
     }
 
+    private void ValidateIdentityFieldPair(
+        Direct3D12NearestNeighborField sourceToTarget, Direct3D12NearestNeighborField targetToSource)
+    {
+        ValidateOwnedField(sourceToTarget);
+        ValidateOwnedField(targetToSource);
+        if (!sourceToTarget.SourceToTarget || targetToSource.SourceToTarget ||
+            !ReferenceEquals(sourceToTarget.Workset, targetToSource.Workset) ||
+            sourceToTarget.PatchRadius != targetToSource.PatchRadius)
+        {
+            throw new ArgumentException(
+                "Identity linking requires opposite-direction fields from the same workset and patch radius.",
+                nameof(targetToSource));
+        }
+    }
+
     private static void TransitionToShaderResource(ID3D12GraphicsCommandList commandList, ID3D12Resource resource)
     {
         commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(resource, ResourceStates.CopyDest,
@@ -987,6 +1074,8 @@ internal sealed class Direct3D12Prototype : IDisposable
             {
                 _disposed = true;
                 _fence.Dispose();
+                _setIdentityLinksPipelineState.Dispose();
+                _setIdentityLinksRootSignature.Dispose();
                 _nearestNeighborMinimizationPipelineState.Dispose();
                 _nearestNeighborMinimizationRootSignature.Dispose();
                 _nearestNeighborInitializationPipelineState.Dispose();
