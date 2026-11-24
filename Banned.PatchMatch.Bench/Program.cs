@@ -31,8 +31,11 @@ switch (args.FirstOrDefault())
         RunLargeSizeVerification(args.Length > 1 ? int.Parse(args[1]) : 1024,
                                  args.Length > 2 ? int.Parse(args[2]) : 4096);
         break;
+    case "simd-matrix" :
+        RunSimdMatrixVerification();
+        break;
     default :
-        Console.WriteLine("usage: Banned.PatchMatch.Bench <stages|corpus [dir]|bench|realcorpus [dir]|simd [maxSize]|simd-large [minSize] [maxSize]>");
+        Console.WriteLine("usage: Banned.PatchMatch.Bench <stages|corpus [dir]|bench|realcorpus [dir]|simd [maxSize]|simd-large [minSize] [maxSize]|simd-matrix>");
         Console.WriteLine("       build with -c Release for meaningful numbers");
         return 1;
 }
@@ -673,6 +676,57 @@ static void RunLargeSizeCase(int size, int samples)
                       $"SIMD {result.VectorMedian,9:F0} ms | speedup {result.Speedup,5:F2}x | " +
                       $"saved {result.SavedPercent,5:F1}% | " +
                       $"equal={result.OutputsEqual} | peak {peakMiB:F0} MiB");
+}
+
+static void RunSimdMatrixVerification()
+{
+    const int size    = 512;
+    const int samples = 3;
+    var image = SyntheticImages.Textured(size, size, seed : 7);
+
+    Console.WriteLine($"vector capabilities: 512={Vector512.IsHardwareAccelerated} " +
+                      $"256={Vector256.IsHardwareAccelerated} 128={Vector128.IsHardwareAccelerated}");
+    SimdDifferentialSmoke();
+    WarmUpLargeSizeBenchmark();
+    Console.WriteLine();
+    Console.WriteLine($"end-to-end matrix ({size}x{size}, median of {samples} paired scalar/default SIMD runs):");
+    Console.WriteLine("  mask     radius    scalar       SIMD   speedup    saved   equal");
+
+    var allEqual   = true;
+    var minSaved   = double.PositiveInfinity;
+    var matrixCell = 0;
+    foreach (var requestedCoverage in new[] { 0.05, 0.25, 0.50 })
+    {
+        var mask = CenterCoverageMask(size, requestedCoverage, out var actualCoverage);
+        foreach (var patchRadius in new[] { 3, 5, 8 })
+        {
+            var options = new PatchMatchOptions { PatchRadius = patchRadius, RandomSeed = 1212 };
+            var result = RunPairedEndToEnd(image, mask, size, options, samples,
+                                           vectorFirst : matrixCell % 2 != 0);
+            Console.WriteLine($"  {actualCoverage,5:P1} {patchRadius,8} {result.ScalarMedian,9:F0} ms " +
+                              $"{result.VectorMedian,9:F0} ms {result.Speedup,8:F2}x " +
+                              $"{result.SavedPercent,7:F1}% {result.OutputsEqual,7}");
+            allEqual &= result.OutputsEqual;
+            minSaved = Math.Min(minSaved, result.SavedPercent);
+            matrixCell++;
+        }
+    }
+
+    PatchSsdDistanceMetric.ForceScalar = false;
+    CollectLargeAllocations();
+    Console.WriteLine($"matrix gate: equal={allEqual}, minimum saved={minSaved:F1}%");
+    if (!allEqual || minSaved < 0)
+    {
+        throw new InvalidOperationException("SIMD end-to-end matrix failed equality or no-regression gate.");
+    }
+}
+
+static byte[] CenterCoverageMask(int size, double coverage, out double actualCoverage)
+{
+    var side  = Math.Clamp((int)Math.Round(size * Math.Sqrt(coverage)), 1, size);
+    var start = (size - side) / 2;
+    actualCoverage = (double)(side * side) / (size * size);
+    return Masks.CenterRectangle(size, size, start, start, start + side, start + side);
 }
 
 static (double ScalarMedian, double VectorMedian, double Speedup, double SavedPercent, bool OutputsEqual)
