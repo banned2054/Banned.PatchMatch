@@ -309,11 +309,11 @@ static void GenerateCorpus(string directory)
 static void RunSimdVerification(int maxSize)
 {
     // 阶段 1 验收：同会话交替运行标量与 SIMD 路径。差分冒烟先证一致，再测内核微基准
-    // （≥2× 门槛）与端到端（20%~30% 门槛，对照 Docs/Baseline.md 的阶段 0 数据）。
+    // （≥2× 门槛）与端到端（20%~30% 门槛，对照阶段 0 冻结数据）。
     // PM_FORCE_VBYTES=64|32|16 强制向量宽度，用于定位特定 ISA 的性能异常。
     // Phase-1 acceptance: alternating scalar/SIMD runs in one session. A differential smoke
     // pass proves equality first, then the kernel micro-benchmark (>=2x gate) and the
-    // end-to-end numbers (20-30% gate vs the stage-0 data in Docs/Baseline.md).
+    // end-to-end numbers (20-30% gate vs the frozen stage-0 data).
     // PM_FORCE_VBYTES=64|32|16 forces the vector width to isolate ISA-specific anomalies.
     if (int.TryParse(Environment.GetEnvironmentVariable("PM_FORCE_VBYTES"), out var forcedBytes))
     {
