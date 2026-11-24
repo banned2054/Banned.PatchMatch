@@ -47,6 +47,8 @@ internal sealed class Direct3D12Prototype : IDisposable
     private readonly ID3D12PipelineState         _downsamplePipelineState;
     private readonly ID3D12RootSignature         _upsampleTargetRootSignature;
     private readonly ID3D12PipelineState         _upsampleTargetPipelineState;
+    private readonly ID3D12RootSignature         _nearestNeighborCoarseInitializationRootSignature;
+    private readonly ID3D12PipelineState         _nearestNeighborCoarseInitializationPipelineState;
     private readonly ID3D12Resource              _similarityWeightsBuffer;
     private readonly ID3D12Fence                 _fence;
     private          ulong                       _nextFenceValue = 1;
@@ -152,6 +154,16 @@ internal sealed class Direct3D12Prototype : IDisposable
             RootSignature = _upsampleTargetRootSignature,
             ComputeShader = upsampleTargetShader
         });
+
+        var nearestNeighborCoarseInitializationShader = LoadShader("NearestNeighborCoarseInitialization.dxil");
+        _nearestNeighborCoarseInitializationRootSignature =
+            _device.CreateRootSignature(nearestNeighborCoarseInitializationShader);
+        _nearestNeighborCoarseInitializationPipelineState =
+            _device.CreateComputePipelineState(new ComputePipelineStateDescription
+            {
+                RootSignature = _nearestNeighborCoarseInitializationRootSignature,
+                ComputeShader = nearestNeighborCoarseInitializationShader
+            });
 
         var similarityWeights = BuildSimilarityWeights();
         _similarityWeightsBuffer = CreateUploadBuffer(
@@ -373,6 +385,42 @@ internal sealed class Direct3D12Prototype : IDisposable
             return await ExecuteInitializeNearestNeighborFieldAsync(workset, patchRadius, randomSeed,
                                                                      sourceToTarget, cancellationToken)
                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 从粗层最近邻场初始化细层的场：继承并缩放粗层链接，原始距离达到上限时做随机重试。方向和补丁半径沿用粗层场。<br/>
+    /// Initializes a fine nearest-neighbor field from the coarse one: coarse links are inherited and rescaled,
+    /// with random retries when the raw distance reaches its maximum. Direction and patch radius come from the
+    /// coarse field.
+    /// </summary>
+    internal async Task<Direct3D12NearestNeighborField> InitializeNearestNeighborFieldFromCoarseAsync(
+        Direct3D12NearestNeighborField coarse, Direct3D12PatchWorkset workset, uint randomSeed,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedField(coarse);
+        ValidateOwnedWorkset(workset);
+        if (ReferenceEquals(coarse.Workset, workset) ||
+            workset.Width < coarse.Workset.Width || workset.Height < coarse.Workset.Height)
+        {
+            throw new ArgumentException(
+                "The workset must differ from the coarse field's workset and be at least as large as it.",
+                nameof(workset));
+        }
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            coarse.ThrowIfDisposed();
+            workset.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            return await ExecuteInitializeNearestNeighborFieldFromCoarseAsync(
+                coarse, workset, randomSeed, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -985,6 +1033,71 @@ internal sealed class Direct3D12Prototype : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
 
             return new Direct3D12NearestNeighborField(this, workset, fieldBuffer, patchRadius, sourceToTarget);
+        }
+        catch
+        {
+            fieldBuffer?.Dispose();
+            throw;
+        }
+    }
+
+    private async Task<Direct3D12NearestNeighborField> ExecuteInitializeNearestNeighborFieldFromCoarseAsync(
+        Direct3D12NearestNeighborField coarse, Direct3D12PatchWorkset workset, uint randomSeed,
+        CancellationToken cancellationToken)
+    {
+        var pixelCount     = checked(workset.Width * workset.Height);
+        var fieldByteCount = checked((ulong)pixelCount * sizeof(uint) * 3);
+        ID3D12Resource? fieldBuffer = null;
+        try
+        {
+            fieldBuffer = CreateBuffer(fieldByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                       ResourceFlags.AllowUnorderedAccess);
+            using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+            using var commandList =
+                _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                    _nearestNeighborCoarseInitializationPipelineState);
+
+            var sourcePixels  = coarse.SourceToTarget ? workset.SourcePixels : workset.TargetPixels;
+            var sourceInvalid = coarse.SourceToTarget ? workset.SourceInvalid : workset.TargetInvalid;
+            var sourceGlobal  = coarse.SourceToTarget ? workset.SourceGlobal : workset.TargetGlobal;
+            var targetPixels  = coarse.SourceToTarget ? workset.TargetPixels : workset.SourcePixels;
+            var targetInvalid = coarse.SourceToTarget ? workset.TargetInvalid : workset.SourceInvalid;
+            var targetGlobal  = coarse.SourceToTarget ? workset.TargetGlobal : workset.SourceGlobal;
+
+            commandList.SetComputeRootSignature(_nearestNeighborCoarseInitializationRootSignature);
+            commandList.SetComputeRootShaderResourceView(0, sourcePixels.GPUVirtualAddress);
+            commandList.SetComputeRootShaderResourceView(1, sourceInvalid.GPUVirtualAddress);
+            commandList.SetComputeRootShaderResourceView(2, sourceGlobal.GPUVirtualAddress);
+            commandList.SetComputeRootShaderResourceView(3, targetPixels.GPUVirtualAddress);
+            commandList.SetComputeRootShaderResourceView(4, targetInvalid.GPUVirtualAddress);
+            commandList.SetComputeRootShaderResourceView(5, targetGlobal.GPUVirtualAddress);
+            commandList.SetComputeRootUnorderedAccessView(6, fieldBuffer.GPUVirtualAddress);
+            // Field buffers stay in the UnorderedAccess state, so the read-only coarse field is bound as a UAV.
+            commandList.SetComputeRootUnorderedAccessView(7, coarse.Buffer.GPUVirtualAddress);
+            var (groupCountX, groupCountY, dispatchWidth) = GetDispatchDimensions(pixelCount);
+            commandList.SetComputeRoot32BitConstant(8, (uint)workset.Width, 0);
+            commandList.SetComputeRoot32BitConstant(8, (uint)workset.Height, 1);
+            commandList.SetComputeRoot32BitConstant(8, (uint)coarse.PatchRadius, 2);
+            commandList.SetComputeRoot32BitConstant(8, randomSeed, 3);
+            commandList.SetComputeRoot32BitConstant(8, (uint)dispatchWidth, 4);
+            commandList.SetComputeRoot32BitConstant(8, MaximumInitializationAttempts, 5);
+            commandList.SetComputeRoot32BitConstant(8, (uint)coarse.Workset.Width, 6);
+            commandList.SetComputeRoot32BitConstant(8, (uint)coarse.Workset.Height, 7);
+            commandList.Dispatch((uint)groupCountX, (uint)groupCountY, 1);
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(fieldBuffer));
+            commandList.Close();
+
+            _commandQueue.ExecuteCommandList(commandList);
+            var fenceValue = _nextFenceValue++;
+            _commandQueue.Signal(_fence, fenceValue).CheckError();
+            if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+            {
+                Interlocked.Increment(ref _asynchronousFenceWaitCount);
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+
+            return new Direct3D12NearestNeighborField(this, workset, fieldBuffer, coarse.PatchRadius,
+                                                      coarse.SourceToTarget);
         }
         catch
         {
@@ -2022,6 +2135,8 @@ internal sealed class Direct3D12Prototype : IDisposable
                 _disposed = true;
                 _fence.Dispose();
                 _similarityWeightsBuffer.Dispose();
+                _nearestNeighborCoarseInitializationPipelineState.Dispose();
+                _nearestNeighborCoarseInitializationRootSignature.Dispose();
                 _upsampleTargetPipelineState.Dispose();
                 _upsampleTargetRootSignature.Dispose();
                 _downsamplePipelineState.Dispose();
