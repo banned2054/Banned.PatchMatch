@@ -43,6 +43,8 @@ internal sealed class Direct3D12Prototype : IDisposable
     private readonly ID3D12PipelineState         _fixedPointMaximizePipelineState;
     private readonly ID3D12RootSignature         _unpackRgbRootSignature;
     private readonly ID3D12PipelineState         _unpackRgbPipelineState;
+    private readonly ID3D12RootSignature         _downsampleRootSignature;
+    private readonly ID3D12PipelineState         _downsamplePipelineState;
     private readonly ID3D12Resource              _similarityWeightsBuffer;
     private readonly ID3D12Fence                 _fence;
     private          ulong                       _nextFenceValue = 1;
@@ -131,6 +133,14 @@ internal sealed class Direct3D12Prototype : IDisposable
         {
             RootSignature = _unpackRgbRootSignature,
             ComputeShader = unpackRgbShader
+        });
+
+        var downsampleShader = LoadShader("Downsample.dxil");
+        _downsampleRootSignature = _device.CreateRootSignature(downsampleShader);
+        _downsamplePipelineState = _device.CreateComputePipelineState(new ComputePipelineStateDescription
+        {
+            RootSignature = _downsampleRootSignature,
+            ComputeShader = downsampleShader
         });
 
         var similarityWeights = BuildSimilarityWeights();
@@ -261,6 +271,35 @@ internal sealed class Direct3D12Prototype : IDisposable
                                                         targetPixels, targetInvalid, targetGlobal,
                                                         width, height, cancellationToken)
                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 把粗层工作集下采样一半，生成金字塔下一层的工作集。新工作集的 target 取"下采样后的 source 加空孔洞蒙版"。<br/>
+    /// Downsamples a coarse workset by half into the next pyramid level's workset. The new target is the
+    /// downsampled source with an empty hole mask.
+    /// </summary>
+    internal async Task<Direct3D12PatchWorkset> CreateDownsampledPatchWorksetAsync(
+        Direct3D12PatchWorkset coarse, CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedWorkset(coarse);
+        if (coarse.Width < 2 || coarse.Height < 2)
+        {
+            throw new ArgumentOutOfRangeException(nameof(coarse), $"({coarse.Width}, {coarse.Height})",
+                                                  "The coarse workset must be at least 2x2 pixels.");
+        }
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            coarse.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            return await ExecuteCreateDownsampledPatchWorksetAsync(coarse, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -1342,6 +1381,110 @@ internal sealed class Direct3D12Prototype : IDisposable
         return result;
     }
 
+    private async Task<Direct3D12PatchWorkset> ExecuteCreateDownsampledPatchWorksetAsync(
+        Direct3D12PatchWorkset coarse, CancellationToken cancellationToken)
+    {
+        var width          = coarse.Width / 2;
+        var height         = coarse.Height / 2;
+        var pixelCount     = checked(width * height);
+        var imageByteCount = AlignToFour(checked(pixelCount * 3));
+        var maskByteCount  = AlignToFour(pixelCount);
+        ID3D12Resource? sourcePixelsBuffer  = null;
+        ID3D12Resource? sourceMaskBuffer    = null;
+        ID3D12Resource? sourceInvalidBuffer = null;
+        ID3D12Resource? sourceGlobalBuffer  = null;
+        ID3D12Resource? targetPixelsBuffer  = null;
+        ID3D12Resource? targetInvalidBuffer = null;
+        ID3D12Resource? targetGlobalBuffer  = null;
+        try
+        {
+            sourcePixelsBuffer = CreateBuffer(imageByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                              ResourceFlags.AllowUnorderedAccess);
+            sourceMaskBuffer = CreateBuffer(maskByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                            ResourceFlags.AllowUnorderedAccess);
+            sourceInvalidBuffer = CreateBuffer(maskByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                               ResourceFlags.AllowUnorderedAccess);
+            sourceGlobalBuffer = CreateBuffer(maskByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                              ResourceFlags.AllowUnorderedAccess);
+            targetPixelsBuffer = CreateBuffer(imageByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                              ResourceFlags.AllowUnorderedAccess);
+            targetInvalidBuffer = CreateBuffer(maskByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                               ResourceFlags.AllowUnorderedAccess);
+            targetGlobalBuffer = CreateBuffer(maskByteCount, HeapType.Default, ResourceStates.UnorderedAccess,
+                                              ResourceFlags.AllowUnorderedAccess);
+            using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+            using var commandList =
+                _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                    _downsamplePipelineState);
+
+            commandList.SetComputeRootSignature(_downsampleRootSignature);
+            commandList.SetComputeRootShaderResourceView(0, coarse.SourcePixels.GPUVirtualAddress);
+            commandList.SetComputeRootShaderResourceView(1, coarse.SourceMask.GPUVirtualAddress);
+            commandList.SetComputeRootShaderResourceView(2, coarse.SourceGlobal.GPUVirtualAddress);
+            commandList.SetComputeRootUnorderedAccessView(3, sourcePixelsBuffer.GPUVirtualAddress);
+            commandList.SetComputeRootUnorderedAccessView(4, sourceMaskBuffer.GPUVirtualAddress);
+            commandList.SetComputeRootUnorderedAccessView(5, sourceGlobalBuffer.GPUVirtualAddress);
+            commandList.SetComputeRootUnorderedAccessView(6, sourceInvalidBuffer.GPUVirtualAddress);
+            commandList.SetComputeRootUnorderedAccessView(7, targetPixelsBuffer.GPUVirtualAddress);
+            commandList.SetComputeRootUnorderedAccessView(8, targetInvalidBuffer.GPUVirtualAddress);
+            commandList.SetComputeRootUnorderedAccessView(9, targetGlobalBuffer.GPUVirtualAddress);
+            var imageWordCount = checked((int)(imageByteCount / sizeof(uint)));
+            var maskWordCount  = checked((int)(maskByteCount / sizeof(uint)));
+            var (groupCountX, groupCountY, dispatchWidth) = GetDispatchDimensions(imageWordCount + maskWordCount);
+            commandList.SetComputeRoot32BitConstant(10, (uint)coarse.Width, 0);
+            commandList.SetComputeRoot32BitConstant(10, (uint)coarse.Height, 1);
+            commandList.SetComputeRoot32BitConstant(10, (uint)dispatchWidth, 2);
+            commandList.Dispatch((uint)groupCountX, (uint)groupCountY, 1);
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(sourcePixelsBuffer));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(sourceMaskBuffer));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(sourceGlobalBuffer));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(sourceInvalidBuffer));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(targetPixelsBuffer));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(targetInvalidBuffer));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierUnorderedAccessView(targetGlobalBuffer));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+                sourcePixelsBuffer, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+                sourceMaskBuffer, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+                sourceGlobalBuffer, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+                sourceInvalidBuffer, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+                targetPixelsBuffer, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+                targetInvalidBuffer, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+            commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+                targetGlobalBuffer, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource));
+            commandList.Close();
+
+            _commandQueue.ExecuteCommandList(commandList);
+            var fenceValue = _nextFenceValue++;
+            _commandQueue.Signal(_fence, fenceValue).CheckError();
+            if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+            {
+                Interlocked.Increment(ref _asynchronousFenceWaitCount);
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+
+            return new Direct3D12PatchWorkset(this, width, height,
+                                              sourcePixelsBuffer, sourceMaskBuffer, sourceInvalidBuffer,
+                                              sourceGlobalBuffer,
+                                              targetPixelsBuffer, targetInvalidBuffer, targetGlobalBuffer);
+        }
+        catch
+        {
+            targetGlobalBuffer?.Dispose();
+            targetInvalidBuffer?.Dispose();
+            targetPixelsBuffer?.Dispose();
+            sourceGlobalBuffer?.Dispose();
+            sourceInvalidBuffer?.Dispose();
+            sourceMaskBuffer?.Dispose();
+            sourcePixelsBuffer?.Dispose();
+            throw;
+        }
+    }
+
     private async Task<PatchWorksetSnapshot> ExecuteReadPatchWorksetAsync(
         Direct3D12PatchWorkset workset, CancellationToken cancellationToken)
     {
@@ -1779,6 +1922,8 @@ internal sealed class Direct3D12Prototype : IDisposable
                 _disposed = true;
                 _fence.Dispose();
                 _similarityWeightsBuffer.Dispose();
+                _downsamplePipelineState.Dispose();
+                _downsampleRootSignature.Dispose();
                 _unpackRgbPipelineState.Dispose();
                 _unpackRgbRootSignature.Dispose();
                 _fixedPointMaximizePipelineState.Dispose();
