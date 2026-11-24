@@ -535,6 +535,90 @@ internal sealed class Direct3D12Prototype : IDisposable
     }
 
     /// <summary>
+    /// 一次提交回读工作集的全部 7 个缓冲，仅供阶段 2 原型差分验证使用。<br/>
+    /// Reads back all seven buffers of a workset in a single submission, for phase-2 prototype
+    /// differential validation only.
+    /// </summary>
+    internal async Task<PatchWorksetSnapshot> ReadPatchWorksetAsync(
+        Direct3D12PatchWorkset workset, CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedWorkset(workset);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            workset.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            return await ExecuteReadPatchWorksetAsync(workset, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 执行阶段 2 的单层、单次非上采样 EM 原型。<br/>
+    /// Runs the phase-2 single-level, single-iteration, non-upscaled EM prototype.
+    /// </summary>
+    internal Task<byte[]> RunNonUpscaledIterationAsync(
+        Direct3D12PatchWorkset workset, int patchRadius, int passCount,
+        uint initializationSeed, uint minimizationSeed,
+        CancellationToken cancellationToken = default)
+    {
+        return RunNonUpscaledIterationsAsync(workset, patchRadius, iterationCount : 1, passCount,
+                                              initializationSeed, minimizationSeed, cancellationToken);
+    }
+
+    /// <summary>
+    /// 执行阶段 2 的单层、多次非上采样 EM 原型。迭代间 target 始终驻留 GPU，仅回读最终 RGB。<br/>
+    /// Runs the phase-2 single-level, multi-iteration, non-upscaled EM prototype. The target remains GPU-resident
+    /// between iterations and only the final RGB image is read back.
+    /// </summary>
+    internal async Task<byte[]> RunNonUpscaledIterationsAsync(
+        Direct3D12PatchWorkset workset, int patchRadius, int iterationCount, int passCount,
+        uint initializationSeed, uint minimizationSeed,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateOwnedWorkset(workset);
+        ValidatePatchRadius(patchRadius);
+        if (iterationCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(iterationCount), iterationCount,
+                                                  "The iteration count must be positive.");
+        }
+
+        if (passCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(passCount), passCount,
+                                                  "The pass count cannot be negative.");
+        }
+
+        using var forward = await InitializeNearestNeighborFieldAsync(
+            workset, patchRadius, initializationSeed, sourceToTarget : true, cancellationToken)
+           .ConfigureAwait(false);
+        using var reverse = await InitializeNearestNeighborFieldAsync(
+            workset, patchRadius, initializationSeed, sourceToTarget : false, cancellationToken)
+           .ConfigureAwait(false);
+        for (var iteration = 0; iteration < iterationCount; iteration++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await SetIdentityLinksAsync(forward, reverse, cancellationToken).ConfigureAwait(false);
+            var iterationSeed = DeriveIterationSeed(minimizationSeed, iteration);
+            await MinimizeNearestNeighborFieldAsync(
+                forward, passCount, iterationSeed, conditionalSkip : true, cancellationToken).ConfigureAwait(false);
+            await MinimizeNearestNeighborFieldAsync(
+                reverse, passCount, iterationSeed, conditionalSkip : true, cancellationToken).ConfigureAwait(false);
+            using var votes = await CreateFixedPointVoteBufferAsync(workset, cancellationToken).ConfigureAwait(false);
+            await AccumulateFixedPointVotesAsync(forward, votes, cancellationToken).ConfigureAwait(false);
+            await AccumulateFixedPointVotesAsync(reverse, votes, cancellationToken).ConfigureAwait(false);
+            await MaximizeFixedPointVotesInPlaceAsync(votes, cancellationToken).ConfigureAwait(false);
+        }
+
+        return await ReadTargetPixelsAsync(workset, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// 回读最近邻场并按 CPU 距离语义归一化，仅供原型验证使用。<br/>
     /// Reads a nearest-neighbor field back and normalizes distances with CPU semantics for prototype validation.
     /// </summary>
@@ -1258,7 +1342,66 @@ internal sealed class Direct3D12Prototype : IDisposable
         return result;
     }
 
+    private async Task<PatchWorksetSnapshot> ExecuteReadPatchWorksetAsync(
+        Direct3D12PatchWorkset workset, CancellationToken cancellationToken)
+    {
+        var pixelCount            = checked(workset.Width * workset.Height);
+        var imageByteCount        = checked(pixelCount * 3);
+        var alignedImageByteCount = AlignToFour(imageByteCount);
+        var alignedMaskByteCount  = AlignToFour(pixelCount);
+        using var sourcePixelsReadback =
+            CreateBuffer(alignedImageByteCount, HeapType.Readback, ResourceStates.CopyDest, ResourceFlags.None);
+        using var sourceMaskReadback =
+            CreateBuffer(alignedMaskByteCount, HeapType.Readback, ResourceStates.CopyDest, ResourceFlags.None);
+        using var sourceInvalidReadback =
+            CreateBuffer(alignedMaskByteCount, HeapType.Readback, ResourceStates.CopyDest, ResourceFlags.None);
+        using var sourceGlobalReadback =
+            CreateBuffer(alignedMaskByteCount, HeapType.Readback, ResourceStates.CopyDest, ResourceFlags.None);
+        using var targetPixelsReadback =
+            CreateBuffer(alignedImageByteCount, HeapType.Readback, ResourceStates.CopyDest, ResourceFlags.None);
+        using var targetInvalidReadback =
+            CreateBuffer(alignedMaskByteCount, HeapType.Readback, ResourceStates.CopyDest, ResourceFlags.None);
+        using var targetGlobalReadback =
+            CreateBuffer(alignedMaskByteCount, HeapType.Readback, ResourceStates.CopyDest, ResourceFlags.None);
+        using var allocator = _device.CreateCommandAllocator(CommandListType.Compute);
+        using var commandList =
+            _device.CreateCommandList<ID3D12GraphicsCommandList>(CommandListType.Compute, allocator,
+                _unpackRgbPipelineState);
+
+        CopyToReadback(commandList, workset.SourcePixels, sourcePixelsReadback, alignedImageByteCount);
+        CopyToReadback(commandList, workset.SourceMask, sourceMaskReadback, alignedMaskByteCount);
+        CopyToReadback(commandList, workset.SourceInvalid, sourceInvalidReadback, alignedMaskByteCount);
+        CopyToReadback(commandList, workset.SourceGlobal, sourceGlobalReadback, alignedMaskByteCount);
+        CopyToReadback(commandList, workset.TargetPixels, targetPixelsReadback, alignedImageByteCount);
+        CopyToReadback(commandList, workset.TargetInvalid, targetInvalidReadback, alignedMaskByteCount);
+        CopyToReadback(commandList, workset.TargetGlobal, targetGlobalReadback, alignedMaskByteCount);
+        commandList.Close();
+
+        _commandQueue.ExecuteCommandList(commandList);
+        var fenceValue = _nextFenceValue++;
+        _commandQueue.Signal(_fence, fenceValue).CheckError();
+        if (await FenceWaiter.WaitAsync(_fence, fenceValue).ConfigureAwait(false))
+        {
+            Interlocked.Increment(ref _asynchronousFenceWaitCount);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return new PatchWorksetSnapshot(
+            ReadBackBytes(sourcePixelsReadback, imageByteCount),
+            ReadBackBytes(sourceMaskReadback, pixelCount),
+            ReadBackBytes(sourceInvalidReadback, pixelCount),
+            ReadBackBytes(sourceGlobalReadback, pixelCount),
+            ReadBackBytes(targetPixelsReadback, imageByteCount),
+            ReadBackBytes(targetInvalidReadback, pixelCount),
+            ReadBackBytes(targetGlobalReadback, pixelCount));
+    }
+
     private static ulong CombineAtomicLanes(uint low, uint high) => ((ulong)high << 32) | low;
+
+    private static uint DeriveIterationSeed(uint seed, int iteration)
+    {
+        return iteration == 0 ? seed : unchecked(seed ^ ((uint)iteration * 0x9e37_79b9u));
+    }
 
     internal static ulong GetWorstCaseFixedPointChannelSum(int pixelCount, int fieldCount)
     {
@@ -1485,6 +1628,24 @@ internal sealed class Direct3D12Prototype : IDisposable
     {
         commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(resource, ResourceStates.CopyDest,
                                                                        ResourceStates.NonPixelShaderResource));
+    }
+
+    private static void CopyToReadback(
+        ID3D12GraphicsCommandList commandList, ID3D12Resource resource, ID3D12Resource readback, ulong byteCount)
+    {
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            resource, ResourceStates.NonPixelShaderResource, ResourceStates.CopySource));
+        commandList.CopyBufferRegion(readback, 0, resource, 0, byteCount);
+        commandList.ResourceBarrier(ResourceBarrier.BarrierTransition(
+            resource, ResourceStates.CopySource, ResourceStates.NonPixelShaderResource));
+    }
+
+    private static byte[] ReadBackBytes(ID3D12Resource readback, int length)
+    {
+        var result = new byte[length];
+        readback.Map<byte>(0, length).CopyTo(result);
+        readback.Unmap(0);
+        return result;
     }
 
     private ID3D12Resource CreateUploadBuffer(ReadOnlySpan<byte> data, ulong size)

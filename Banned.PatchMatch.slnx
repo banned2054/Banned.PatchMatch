@@ -1,6 +1,7 @@
 <Solution>
   <Project Path="Banned.PatchMatch/Banned.PatchMatch.csproj" />
   <Project Path="Banned.PatchMatch.Direct3D12/Banned.PatchMatch.Direct3D12.csproj" />
+  <Project Path="Banned.PatchMatch.Direct3D12.AotSmoke/Banned.PatchMatch.Direct3D12.AotSmoke.csproj" />
   <Project Path="Banned.PatchMatch.Direct3D12.Test/Banned.PatchMatch.Direct3D12.Test.csproj" />
   <Project Path="Banned.PatchMatch.AotSmoke/Banned.PatchMatch.AotSmoke.csproj" />
   <Project Path="Banned.PatchMatch.Test/Banned.PatchMatch.Test.csproj" />
