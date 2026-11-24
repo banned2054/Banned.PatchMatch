@@ -27,8 +27,12 @@ switch (args.FirstOrDefault())
     case "simd" :
         RunSimdVerification(args.Length > 1 ? int.Parse(args[1]) : 2048);
         break;
+    case "simd-large" :
+        RunLargeSizeVerification(args.Length > 1 ? int.Parse(args[1]) : 1024,
+                                 args.Length > 2 ? int.Parse(args[2]) : 4096);
+        break;
     default :
-        Console.WriteLine("usage: Banned.PatchMatch.Bench <stages|corpus [dir]|bench|realcorpus [dir]|simd [maxSize]>");
+        Console.WriteLine("usage: Banned.PatchMatch.Bench <stages|corpus [dir]|bench|realcorpus [dir]|simd [maxSize]|simd-large [minSize] [maxSize]>");
         Console.WriteLine("       build with -c Release for meaningful numbers");
         return 1;
 }
@@ -605,6 +609,127 @@ static void SimdEndToEndBenchmark(int maxSize)
     }
 
     PatchSsdDistanceMetric.ForceScalar = false;
+}
+
+static void RunLargeSizeVerification(int minSize, int maxSize)
+{
+    if (minSize <= 0 || maxSize < minSize)
+    {
+        throw new ArgumentOutOfRangeException(nameof(minSize), "Expected 0 < minSize <= maxSize.");
+    }
+
+    Console.WriteLine($"vector capabilities: 512={Vector512.IsHardwareAccelerated} " +
+                      $"256={Vector256.IsHardwareAccelerated} 128={Vector128.IsHardwareAccelerated}");
+    SimdDifferentialSmoke();
+    WarmUpLargeSizeBenchmark();
+
+    Console.WriteLine();
+    Console.WriteLine("large end-to-end (center-rect ~25% mask, r=3, paired scalar/default SIMD):");
+    foreach (var size in new[] { 1024, 2048, 4096 }.Where(size => size >= minSize && size <= maxSize))
+    {
+        var samples = size <= 2048 ? 3 : 1;
+        try
+        {
+            RunLargeSizeCase(size, samples);
+        }
+        catch (OutOfMemoryException)
+        {
+            Console.WriteLine($"  {size}x{size}: OUT OF MEMORY");
+        }
+        finally
+        {
+            PatchSsdDistanceMetric.ForceScalar = false;
+            CollectLargeAllocations();
+        }
+    }
+}
+
+static void WarmUpLargeSizeBenchmark()
+{
+    const int size = 64;
+    var image = SyntheticImages.Textured(size, size, seed : 7);
+    var mask = Masks.CenterRectangle(size, size, size / 4, size / 4, 3 * size / 4, 3 * size / 4);
+    var options = new PatchMatchOptions { PatchRadius = 3, RandomSeed = 1212 };
+
+    PatchSsdDistanceMetric.ForceScalar = true;
+    PatchMatchInpainter.Inpaint(image, (byte[])mask.Clone(), size, size, options);
+    PatchSsdDistanceMetric.ForceScalar      = false;
+    PatchSsdDistanceMetric.UseFeatureLayout = true;
+    PatchSsdDistanceMetric.ForceVectorBytes = null;
+    PatchMatchInpainter.Inpaint(image, (byte[])mask.Clone(), size, size, options);
+    CollectLargeAllocations();
+}
+
+static void RunLargeSizeCase(int size, int samples)
+{
+    var image   = SyntheticImages.Textured(size, size, seed : 7);
+    var mask    = Masks.CenterRectangle(size, size, size / 4, size / 4, 3 * size / 4, 3 * size / 4);
+    var options = new PatchMatchOptions { PatchRadius = 3, RandomSeed = 1212 };
+
+    var result = RunPairedEndToEnd(image, mask, size, options, samples, vectorFirst : false);
+    var statistic = samples == 1 ? "single pair" : $"median of {samples}";
+    var peakMiB = Process.GetCurrentProcess().PeakWorkingSet64 / (1024.0 * 1024.0);
+    Console.WriteLine($"  {size}x{size} ({statistic}): scalar {result.ScalarMedian,9:F0} ms | " +
+                      $"SIMD {result.VectorMedian,9:F0} ms | speedup {result.Speedup,5:F2}x | " +
+                      $"saved {result.SavedPercent,5:F1}% | " +
+                      $"equal={result.OutputsEqual} | peak {peakMiB:F0} MiB");
+}
+
+static (double ScalarMedian, double VectorMedian, double Speedup, double SavedPercent, bool OutputsEqual)
+    RunPairedEndToEnd(byte[] image, byte[] mask, int size, PatchMatchOptions options, int samples, bool vectorFirst)
+{
+    if (samples <= 0 || samples % 2 == 0)
+    {
+        throw new ArgumentOutOfRangeException(nameof(samples), "Expected a positive odd sample count.");
+    }
+
+    (double Milliseconds, byte[] Output) Run(bool scalar)
+    {
+        CollectLargeAllocations();
+        PatchSsdDistanceMetric.ForceScalar      = scalar;
+        PatchSsdDistanceMetric.UseFeatureLayout = true;
+        PatchSsdDistanceMetric.ForceVectorBytes = null;
+        var stopwatch = Stopwatch.StartNew();
+        var output = PatchMatchInpainter.Inpaint(image, (byte[])mask.Clone(), size, size, options);
+        stopwatch.Stop();
+        return (stopwatch.Elapsed.TotalMilliseconds, output);
+    }
+
+    var scalarSamples = new double[samples];
+    var vectorSamples = new double[samples];
+    var outputsEqual  = true;
+    for (var sample = 0; sample < samples; sample++)
+    {
+        (double Milliseconds, byte[] Output) scalar;
+        (double Milliseconds, byte[] Output) vector;
+        var scalarFirst = (sample % 2 == 0) != vectorFirst;
+        if (scalarFirst)
+        {
+            scalar = Run(true);
+            vector = Run(false);
+        }
+        else
+        {
+            vector = Run(false);
+            scalar = Run(true);
+        }
+
+        scalarSamples[sample] = scalar.Milliseconds;
+        vectorSamples[sample] = vector.Milliseconds;
+        outputsEqual &= scalar.Output.AsSpan().SequenceEqual(vector.Output);
+    }
+
+    var scalarMedian = Median(scalarSamples);
+    var vectorMedian = Median(vectorSamples);
+    var speedup = scalarMedian / vectorMedian;
+    return (scalarMedian, vectorMedian, speedup, 100 * (1 - 1 / speedup), outputsEqual);
+}
+
+static void CollectLargeAllocations()
+{
+    GC.Collect();
+    GC.WaitForPendingFinalizers();
+    GC.Collect();
 }
 
 static byte[] RandomBytesBench(Random random, int count)
